@@ -74,6 +74,7 @@ private:
 	void publishControls(ControlInfoMap *ispControls) const;
 	void updateLineDuration();
 	int32_t manualExposureMax() const;
+	int32_t digitalMax() const;
 	void applySensor();
 	void applyIsp();
 	void applyTables();
@@ -103,6 +104,7 @@ private:
 	bool awbEnabled_;
 	int32_t wbRed_;		/* Q10 */
 	int32_t wbBlue_;
+	int32_t channelGainMax_;	/* Q10, the IFE's limit on each channel's gain */
 	int32_t blackLevel_;	/* 10-bit units */
 	unsigned int frameCount_;
 

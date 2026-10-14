@@ -182,6 +182,18 @@ int32_t CamssIspInline::manualExposureMax() const
 }
 
 /*
+ * The digital gain the IFE can still add on top of the colour gains: the
+ * channel gains it receives are white balance times digital, and once the
+ * strongest of them reaches the block's limit, more digital gain only
+ * raises green and the white balance is lost (a green picture in the dark).
+ */
+int32_t CamssIspInline::digitalMax() const
+{
+	int32_t wb = std::max({ wbRed_, wbBlue_, kWbUnity });
+	return std::clamp<int32_t>(channelGainMax_ * kWbUnity / wb, kWbUnity, kDigitalMax);
+}
+
+/*
  * The controls applications see: the auto algorithms on or off, and the
  * manual exposure, gain and colour gains that apply when they are off.
  * Without any, the pipewire libcamera node is dropped by wireplumber
@@ -233,6 +245,9 @@ CamssIspInline::CamssIspInline(CamssCsiCamera *csi, CamssFrames *frameInfos)
 	updateLineDuration();
 	wbRed_ = kWbUnity;
 	wbBlue_ = kWbUnity;
+	auto wbCtrl = pix_->controls().find(V4L2_CID_RED_BALANCE);
+	channelGainMax_ = wbCtrl != pix_->controls().end()
+			? wbCtrl->second.max().get<int32_t>() : kWbMax;
 	blackLevel_ = kDefaultBlackLevel;
 	targetLuma_ = kTargetLuma;
 	centreWeight_ = kCentreWeight;
@@ -674,10 +689,12 @@ void CamssIspInline::applyTables()
 
 void CamssIspInline::applyIsp()
 {
+	exposure_.digital = std::min(exposure_.digital, digitalMax());
+
 	ControlList ctrls(pix_->controls());
 	ctrls.set(V4L2_CID_BLACK_LEVEL, blackLevel_);
-	ctrls.set(V4L2_CID_RED_BALANCE, std::min(kWbMax, wbRed_ * exposure_.digital / kWbUnity));
-	ctrls.set(V4L2_CID_BLUE_BALANCE, std::min(kWbMax, wbBlue_ * exposure_.digital / kWbUnity));
+	ctrls.set(V4L2_CID_RED_BALANCE, std::min(channelGainMax_, wbRed_ * exposure_.digital / kWbUnity));
+	ctrls.set(V4L2_CID_BLUE_BALANCE, std::min(channelGainMax_, wbBlue_ * exposure_.digital / kWbUnity));
 	ctrls.set(V4L2_CID_GAIN, exposure_.digital);
 	pix_->setControls(&ctrls);
 }
@@ -781,7 +798,7 @@ void CamssIspInline::runAlgorithms(FrameBuffer *buffer, unsigned int frame)
 		e = { exposureSlow, std::min(gainToCode(total / exposureSlow), gainMax_), 0, kWbUnity };
 	} else {
 		e = { exposureSlow, gainMax_, 0,
-		      std::clamp<int32_t>(total / (exposureSlow * gainTop) * kWbUnity, kWbUnity, kDigitalMax) };
+		      std::clamp<int32_t>(total / (exposureSlow * gainTop) * kWbUnity, kWbUnity, digitalMax()) };
 	}
 	e.vblank = std::clamp<int32_t>(e.exposure + exposureMargin_ - (frameLines - vblankDef_),
 				       vblankDef_, vblankMax_);
