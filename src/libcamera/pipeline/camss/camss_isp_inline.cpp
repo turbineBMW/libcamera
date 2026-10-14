@@ -12,6 +12,7 @@
 
 #include <linux/media-bus-format.h>
 #include <linux/v4l2-controls.h>
+#include <linux/videodev2.h>
 
 #include <libcamera/base/log.h>
 
@@ -49,6 +50,14 @@ constexpr unsigned int kStatsStep = 16;
 constexpr int32_t kDefaultBlackLevel = 64;
 
 } /* namespace */
+
+/* The smallest output the scalers reach, even dimensions */
+static Size minSize(const Size &in)
+{
+	constexpr unsigned int kScaleMax = 16;
+	return Size(((in.width + kScaleMax - 1) / kScaleMax + 1) & ~1u,
+		    ((in.height + kScaleMax - 1) / kScaleMax + 1) & ~1u);
+}
 
 std::unique_ptr<CamssIspInline> CamssIspInline::match(CamssCsiCamera *csi,
 						      CamssFrames *frameInfos,
@@ -123,8 +132,9 @@ Size CamssIspInline::getMargins([[maybe_unused]] PixelFormat inputFormat)
 
 StreamConfiguration CamssIspInline::generateConfiguration(const StreamConfiguration &raw) const
 {
+	/* The VID path scales down by up to 16 in each direction */
 	std::map<PixelFormat, std::vector<SizeRange>> formats;
-	formats[formats::NV12] = { SizeRange(raw.size) };
+	formats[formats::NV12] = { SizeRange(minSize(raw.size), raw.size, 2, 2) };
 
 	StreamConfiguration cfg{ StreamFormats{ formats } };
 	cfg.size = raw.size;
@@ -139,9 +149,11 @@ StreamConfiguration CamssIspInline::validate(const StreamConfiguration &raw,
 {
 	StreamConfiguration cfg;
 
-	/* The IFE's output size is the sensor's; no scaler is exposed yet. */
 	cfg.pixelFormat = formats::NV12;
-	cfg.size = raw.size;
+	if (SizeRange(minSize(raw.size), raw.size, 2, 2).contains(req.size))
+		cfg.size = req.size;
+	else
+		cfg.size = raw.size;
 
 	V4L2DeviceFormat fmt;
 	fmt.fourcc = output_->toV4L2PixelFormat(cfg.pixelFormat);
@@ -186,11 +198,27 @@ int CamssIspInline::configure(const StreamConfiguration &inputCfg,
 	if (ret)
 		return ret;
 
+	/* scale with the sink compose rectangle, crop (none) with the source's */
+	Rectangle compose(0, 0, outputCfg.size);
+	ret = pix_->setSelection(0, V4L2_SEL_TGT_COMPOSE, &compose, V4L2Subdevice::ActiveFormat);
+	if (ret)
+		return ret;
+	Rectangle crop(0, 0, outputCfg.size);
+	ret = pix_->setSelection(1, V4L2_SEL_TGT_CROP, &crop, V4L2Subdevice::ActiveFormat);
+	if (ret)
+		return ret;
+
 	V4L2SubdeviceFormat pixFmt = csidFmt;
 	pixFmt.code = MEDIA_BUS_FMT_YUYV8_1_5X8;
+	pixFmt.size = outputCfg.size;
 	ret = pix_->setFormat(1, &pixFmt, V4L2Subdevice::ActiveFormat);
 	if (ret)
 		return ret;
+	if (pixFmt.size != outputCfg.size) {
+		LOG(Camss, Error) << "PIX source pad gave " << pixFmt.size
+				  << " for " << outputCfg.size;
+		return -EINVAL;
+	}
 
 	V4L2DeviceFormat fmt;
 	fmt.fourcc = output_->toV4L2PixelFormat(outputCfg.pixelFormat);
@@ -209,7 +237,22 @@ int CamssIspInline::configure(const StreamConfiguration &inputCfg,
 	size_ = fmt.size;
 	stride_ = fmt.planes[0].bpl;
 	bufferCount_ = outputCfg.bufferCount;
-	exposureMargin_ = inputCfg.size.height + vblankDef_ - exposureMax_;
+
+	/*
+	 * The exposure limit follows the frame length the sensor currently
+	 * has, so read both together for the margin, then take the limit at
+	 * the default frame length as the full-rate maximum.
+	 */
+	CameraSensor *sensor = const_cast<CameraSensor *>(sensor_);
+	static const uint32_t ids[] = { V4L2_CID_VBLANK };
+	ControlList cur = sensor->getControls(ids);
+	const ControlInfoMap &ctrls = sensor->controls();
+	int32_t vblankCur = cur.contains(V4L2_CID_VBLANK) ? cur.get(V4L2_CID_VBLANK).get<int32_t>() : vblankDef_;
+	int32_t exposureMaxCur = ctrls.find(V4L2_CID_EXPOSURE)->second.max().get<int32_t>();
+	exposureMargin_ = inputCfg.size.height + vblankCur - exposureMaxCur;
+	exposureMax_ = inputCfg.size.height + vblankDef_ - exposureMargin_;
+	exposure_.exposure = std::min(exposure_.exposure, exposureMax_);
+	exposure_.vblank = vblankDef_;
 
 	return 0;
 }
