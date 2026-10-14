@@ -51,12 +51,39 @@ constexpr int32_t kDefaultBlackLevel = 64;
 
 } /* namespace */
 
-/* The smallest output the scalers reach, even dimensions */
-static Size minSize(const Size &in)
+/*
+ * Output sizes: the sensor size and a ladder of common ones within what
+ * the scalers reach (a sixteenth of the sensor size), widths a multiple
+ * of 16 for the write master. Discrete sizes rather than a range: the
+ * pipewire plugin encodes a libcamera range as a stepped rectangle choice
+ * that it cannot then intersect with a client's fixed size.
+ */
+static std::vector<Size> outputSizes(const Size &in)
 {
+	static const Size ladder[] = {
+		{ 3840, 2160 }, { 2560, 1440 }, { 1920, 1440 }, { 1920, 1080 },
+		{ 1600, 1200 }, { 1280, 960 }, { 1280, 720 }, { 1024, 768 },
+		{ 960, 540 }, { 800, 600 }, { 640, 480 }, { 640, 360 }, { 320, 240 },
+	};
 	constexpr unsigned int kScaleMax = 16;
-	return Size(((in.width + kScaleMax - 1) / kScaleMax + 1) & ~1u,
-		    ((in.height + kScaleMax - 1) / kScaleMax + 1) & ~1u);
+	std::vector<Size> sizes;
+
+	sizes.push_back(Size(in.width & ~15u, in.height & ~1u));
+	for (const Size &sz : ladder) {
+		if (sz.width <= in.width && sz.height <= in.height &&
+		    sz.width * kScaleMax >= in.width && sz.height * kScaleMax >= in.height &&
+		    sz != sizes.front())
+			sizes.push_back(sz);
+	}
+	return sizes;
+}
+
+static bool sizeOffered(const Size &in, const Size &req)
+{
+	for (const Size &sz : outputSizes(in))
+		if (sz == req)
+			return true;
+	return false;
 }
 
 std::unique_ptr<CamssIspInline> CamssIspInline::match(CamssCsiCamera *csi,
@@ -132,9 +159,9 @@ Size CamssIspInline::getMargins([[maybe_unused]] PixelFormat inputFormat)
 
 StreamConfiguration CamssIspInline::generateConfiguration(const StreamConfiguration &raw) const
 {
-	/* The VID path scales down by up to 16 in each direction */
 	std::map<PixelFormat, std::vector<SizeRange>> formats;
-	formats[formats::NV12] = { SizeRange(minSize(raw.size), raw.size, 2, 2) };
+	for (const Size &sz : outputSizes(raw.size))
+		formats[formats::NV12].emplace_back(sz);
 
 	StreamConfiguration cfg{ StreamFormats{ formats } };
 	cfg.size = raw.size;
@@ -150,10 +177,10 @@ StreamConfiguration CamssIspInline::validate(const StreamConfiguration &raw,
 	StreamConfiguration cfg;
 
 	cfg.pixelFormat = formats::NV12;
-	if (SizeRange(minSize(raw.size), raw.size, 2, 2).contains(req.size))
+	if (sizeOffered(raw.size, req.size))
 		cfg.size = req.size;
 	else
-		cfg.size = raw.size;
+		cfg.size = outputSizes(raw.size).front();
 
 	V4L2DeviceFormat fmt;
 	fmt.fourcc = output_->toV4L2PixelFormat(cfg.pixelFormat);
@@ -198,15 +225,32 @@ int CamssIspInline::configure(const StreamConfiguration &inputCfg,
 	if (ret)
 		return ret;
 
-	/* scale with the sink compose rectangle, crop (none) with the source's */
-	Rectangle compose(0, 0, outputCfg.size);
+	/*
+	 * Keep the sensor's aspect: scale so the output is covered (the sink
+	 * pad's compose rectangle), then crop the centre to it (the source
+	 * pad's crop rectangle). Even offsets, so the chroma lands on a
+	 * sample.
+	 */
+	const Size &in = csidFmt.size;
+	const Size &out = outputCfg.size;
+	Size scaled;
+	if ((uint64_t)out.width * in.height >= (uint64_t)out.height * in.width)
+		scaled = Size(out.width, ((uint64_t)in.height * out.width / in.width) & ~1u);
+	else
+		scaled = Size(((uint64_t)in.width * out.height / in.height) & ~1u, out.height);
+	scaled.width = std::max(scaled.width, out.width);
+	scaled.height = std::max(scaled.height, out.height);
+	Rectangle compose(0, 0, scaled);
 	ret = pix_->setSelection(0, V4L2_SEL_TGT_COMPOSE, &compose, V4L2Subdevice::ActiveFormat);
 	if (ret)
 		return ret;
-	Rectangle crop(0, 0, outputCfg.size);
+	Rectangle crop(((compose.width - out.width) / 2) & ~1u,
+		       ((compose.height - out.height) / 2) & ~1u, out);
 	ret = pix_->setSelection(1, V4L2_SEL_TGT_CROP, &crop, V4L2Subdevice::ActiveFormat);
 	if (ret)
 		return ret;
+	LOG(Camss, Debug) << "PIX scale " << in << " to " << compose.size()
+			  << ", crop " << crop;
 
 	V4L2SubdeviceFormat pixFmt = csidFmt;
 	pixFmt.code = MEDIA_BUS_FMT_YUYV8_1_5X8;
