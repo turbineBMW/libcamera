@@ -251,10 +251,14 @@ CamssIspInline::CamssIspInline(CamssCsiCamera *csi, CamssFrames *frameInfos)
  *   version: 1
  *   ae: { target: 120, centre_weight: 3 }
  *   awb: { red_bias: 1.0, blue_bias: 0.95 }    # leave some of the illuminant in
+ *   black_level: 64                             # sensor pedestal, 10-bit units
  *   gamma: { toe: 2.6, knee: 0.17, gamma: 2.9 }   # or gamma_lut: [256 x 0..4095]
  *   ccm: [r_r, r_g, r_b, g_r, g_g, g_b, b_r, b_g, b_b]   # row-major, 1.0 unity
  *   ccm_strength: 1.0                                   # blend towards identity
  *   ccm_offsets: [r, g, b]                              # fraction of full scale
+ *   lsc: { r: [221 gains], gr: [...], gb: [...], b: [...] }  # 13 rows x 17 columns
+ *   lsc_strength: 1.0                                   # blend towards unity
+ *   lsc_response: [a, b]                                # applied = a g^2 + b g + (1 - a - b)
  *
  * Without a file the loop keeps its defaults and the driver its own curve
  * and identity matrix.
@@ -290,6 +294,7 @@ void CamssIspInline::loadTuning()
 	const ValueNode &awb = (*root)["awb"];
 	awbRedBias_ = awb["red_bias"].get<double>().value_or(1.0);
 	awbBlueBias_ = awb["blue_bias"].get<double>().value_or(1.0);
+	blackLevel_ = (*root)["black_level"].get<int32_t>().value_or(kDefaultBlackLevel);
 
 	if (root->contains("gamma_lut")) {
 		auto values = (*root)["gamma_lut"].get<std::vector<uint32_t>>();
@@ -327,8 +332,48 @@ void CamssIspInline::loadTuning()
 		}
 	}
 
+	if (root->contains("lsc")) {
+		const ValueNode &lsc = (*root)["lsc"];
+		double strength = (*root)["lsc_strength"].get<double>().value_or(1.0);
+		/*
+		 * The block's measured gain response: applied = a g^2 + b g + c
+		 * for a table value g (c = 1 - a - b); the table is written with
+		 * the inverse so the mesh's gains come out as given.
+		 */
+		auto resp = (*root)["lsc_response"].get<std::vector<double>>();
+		double ra = 0.0, rb = 1.0;
+		if (resp && resp->size() == 2) {
+			ra = (*resp)[0];
+			rb = (*resp)[1];
+		}
+		constexpr unsigned int points = QCOM_CAMSS_LSC_MESH_ROWS * QCOM_CAMSS_LSC_MESH_COLS;
+		std::vector<uint16_t> mesh;
+		for (const char *ch : { "r", "gr", "gb", "b" }) {
+			auto v = lsc[ch].get<std::vector<double>>();
+			if (!v || v->size() != points) {
+				LOG(Camss, Warning) << "lsc." << ch << " needs " << points << " gains";
+				mesh.clear();
+				break;
+			}
+			for (double gain : *v) {
+				double g = 1.0 + strength * (gain - 1.0);
+				if (ra != 0.0) {
+					double rc = 1.0 - ra - rb;
+					g = (-rb + std::sqrt(rb * rb - 4.0 * ra * (rc - g))) / (2.0 * ra);
+				} else if (rb != 1.0) {
+					g = 1.0 + (g - 1.0) / rb;
+				}
+				mesh.push_back(std::clamp<int>(std::lround(g * QCOM_CAMSS_LSC_UNITY),
+							       QCOM_CAMSS_LSC_UNITY, QCOM_CAMSS_LSC_MAX));
+			}
+		}
+		if (!mesh.empty())
+			lscMesh_ = std::move(mesh);
+	}
+
 	LOG(Camss, Info) << "Tuning from " << path << ": target " << targetLuma_
-			 << (gammaLut_ ? ", gamma curve" : "") << (ccm_ ? ", colour matrix" : "");
+			 << (gammaLut_ ? ", gamma curve" : "") << (ccm_ ? ", colour matrix" : "")
+			 << (lscMesh_ ? ", shading mesh" : "");
 }
 
 CamssIspInline::~CamssIspInline() = default;
@@ -618,6 +663,8 @@ void CamssIspInline::applyTables()
 		ctrls.set(V4L2_CID_QCOM_CAMSS_GAMMA_LUT, Span<const uint16_t>(*gammaLut_));
 	if (ccm_ && info.find(V4L2_CID_QCOM_CAMSS_CCM) != info.end())
 		ctrls.set(V4L2_CID_QCOM_CAMSS_CCM, Span<const int32_t>(*ccm_));
+	if (lscMesh_ && info.find(V4L2_CID_QCOM_CAMSS_LSC_MESH) != info.end())
+		ctrls.set(V4L2_CID_QCOM_CAMSS_LSC_MESH, Span<const uint16_t>(*lscMesh_));
 	if (!ctrls.empty() && pix_->setControls(&ctrls) < 0)
 		LOG(Camss, Warning) << "Cannot set the tuning tables";
 }

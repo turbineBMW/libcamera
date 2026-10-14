@@ -113,6 +113,7 @@ private:
 	double awbBlueBias_;
 	std::optional<std::array<uint16_t, 256>> gammaLut_;
 	std::optional<std::array<int32_t, 12>> ccm_;
+	std::optional<std::vector<uint16_t>> lscMesh_;
 };
 
 } /* namespace libcamera */

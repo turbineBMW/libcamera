@@ -38,4 +38,21 @@
 #define QCOM_CAMSS_CCM_SIZE		12
 #define QCOM_CAMSS_CCM_UNITY		1024
 
+/*
+ * Lens shading: four 13 x 17 meshes of Q10 gains, one per Bayer channel
+ * in the order R, Gr, Gb, B, each row-major with 17 columns. The mesh
+ * spans the whole frame at the ISP input, the first and last points on
+ * the first and last pixels; 1024 is unity and the hardware applies up
+ * to 8x. An all-zero table turns the correction off.
+ */
+#define V4L2_CID_QCOM_CAMSS_LSC_MESH	(V4L2_CID_USER_QCOM_CAMSS_BASE + 2)
+#define QCOM_CAMSS_LSC_MESH_COLS	17
+#define QCOM_CAMSS_LSC_MESH_ROWS	13
+#define QCOM_CAMSS_LSC_MESH_CHANNELS	4
+#define QCOM_CAMSS_LSC_MESH_SIZE	(QCOM_CAMSS_LSC_MESH_CHANNELS * \
+					 QCOM_CAMSS_LSC_MESH_ROWS * \
+					 QCOM_CAMSS_LSC_MESH_COLS)
+#define QCOM_CAMSS_LSC_UNITY		1024
+#define QCOM_CAMSS_LSC_MAX		8191
+
 #endif /* __UAPI_QCOM_CAMSS_CONTROLS_H */
