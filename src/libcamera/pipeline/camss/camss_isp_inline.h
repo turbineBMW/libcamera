@@ -116,7 +116,9 @@ private:
 
 	/* tuning: exposure target, and the tables the PIX line takes */
 	double targetLuma_;
+	double zoom_;		/* field of view narrowed by this factor */
 	double centreWeight_;
+	double slowFrame_;	/* longest frame in the dark, in default frame lengths */
 	double awbRedBias_;	/* multipliers on the grey-world gains */
 	double awbBlueBias_;
 	std::optional<std::array<uint16_t, 256>> gammaLut_;

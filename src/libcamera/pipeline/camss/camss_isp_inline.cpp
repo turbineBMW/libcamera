@@ -57,7 +57,7 @@ constexpr int32_t kDigitalMax = 4096;
 constexpr double kTargetLuma = 120.0;
 constexpr double kCentreWeight = 3.0;	/* weight of the central quarter of the frame */
 constexpr int32_t kGainKnee = 768;	/* IMX681 code for 4x */
-constexpr double kSlowFrame = 2.0;	/* allow frames up to twice as long in the dark */
+constexpr double kSlowFrame = 2.0;	/* allow frames up to this many default lengths in the dark */
 constexpr unsigned int kStatsStep = 16;
 constexpr int32_t kDefaultBlackLevel = 64;
 
@@ -253,7 +253,9 @@ CamssIspInline::CamssIspInline(CamssCsiCamera *csi, CamssFrames *frameInfos)
 			? wbCtrl->second.max().get<int32_t>() : kWbMax;
 	blackLevel_ = kDefaultBlackLevel;
 	targetLuma_ = kTargetLuma;
+	zoom_ = 1.0;
 	centreWeight_ = kCentreWeight;
+	slowFrame_ = kSlowFrame;
 	awbRedBias_ = 1.0;
 	awbBlueBias_ = 1.0;
 	loadTuning();
@@ -267,9 +269,10 @@ CamssIspInline::CamssIspInline(CamssCsiCamera *csi, CamssFrames *frameInfos)
  * <sysconfdir>/libcamera/camss/<sensor model>.yaml:
  *
  *   version: 1
- *   ae: { target: 120, centre_weight: 3 }
+ *   ae: { target: 120, centre_weight: 3, slow_frame: 2 }   # frame length cap, x default
  *   awb: { red_bias: 1.0, blue_bias: 0.95 }    # leave some of the illuminant in
  *   black_level: 64                             # sensor pedestal, 10-bit units
+ *   zoom: 1.3                                   # narrow the field of view (centre crop)
  *   gamma: { toe: 2.6, knee: 0.17, gamma: 2.9 }   # or gamma_lut: [256 x 0..4095]
  *   ccm: [r_r, r_g, r_b, g_r, g_g, g_b, b_r, b_g, b_b]   # row-major, 1.0 unity
  *   ccm_strength: 1.0                                   # blend towards identity
@@ -310,10 +313,12 @@ void CamssIspInline::loadTuning()
 	const ValueNode &ae = (*root)["ae"];
 	targetLuma_ = ae["target"].get<double>().value_or(kTargetLuma);
 	centreWeight_ = ae["centre_weight"].get<double>().value_or(kCentreWeight);
+	slowFrame_ = std::max(ae["slow_frame"].get<double>().value_or(kSlowFrame), 1.0);
 	const ValueNode &awb = (*root)["awb"];
 	awbRedBias_ = awb["red_bias"].get<double>().value_or(1.0);
 	awbBlueBias_ = awb["blue_bias"].get<double>().value_or(1.0);
 	blackLevel_ = (*root)["black_level"].get<int32_t>().value_or(kDefaultBlackLevel);
+	zoom_ = (*root)["zoom"].get<double>().value_or(1.0);
 
 	const ValueNode &dn = (*root)["denoise"];
 	denoiseParams_.enabled = dn["enable"].get<bool>().value_or(denoiseParams_.enabled);
@@ -485,7 +490,9 @@ int CamssIspInline::configure(const StreamConfiguration &inputCfg,
 	 * Keep the sensor's aspect: scale so the output is covered (the sink
 	 * pad's compose rectangle), then crop the centre to it (the source
 	 * pad's crop rectangle). Even offsets, so the chroma lands on a
-	 * sample.
+	 * sample. The tuning's zoom scales to that much more than the
+	 * output before the crop, as far as the scaler (downscale only)
+	 * allows.
 	 */
 	const Size &in = csidFmt.size;
 	const Size &out = outputCfg.size;
@@ -494,6 +501,13 @@ int CamssIspInline::configure(const StreamConfiguration &inputCfg,
 		scaled = Size(out.width, ((uint64_t)in.height * out.width / in.width) & ~1u);
 	else
 		scaled = Size(((uint64_t)in.width * out.height / in.height) & ~1u, out.height);
+	scaled.width = std::max(scaled.width, out.width);
+	scaled.height = std::max(scaled.height, out.height);
+	double zoom = std::min({ std::max(zoom_, 1.0),
+				 static_cast<double>(in.width) / scaled.width,
+				 static_cast<double>(in.height) / scaled.height });
+	scaled = Size(static_cast<unsigned int>(scaled.width * zoom) & ~1u,
+		      static_cast<unsigned int>(scaled.height * zoom) & ~1u);
 	scaled.width = std::max(scaled.width, out.width);
 	scaled.height = std::max(scaled.height, out.height);
 	Rectangle compose(0, 0, scaled);
@@ -505,7 +519,7 @@ int CamssIspInline::configure(const StreamConfiguration &inputCfg,
 	ret = pix_->setSelection(1, V4L2_SEL_TGT_CROP, &crop, V4L2Subdevice::ActiveFormat);
 	if (ret)
 		return ret;
-	LOG(Camss, Debug) << "PIX scale " << in << " to " << compose.size()
+	LOG(Camss, Info) << "PIX scale " << in << " to " << compose.size()
 			  << ", crop " << crop;
 
 	V4L2SubdeviceFormat pixFmt = csidFmt;
@@ -854,7 +868,7 @@ void CamssIspInline::runAlgorithms(FrameBuffer *buffer, unsigned int frame)
 	double total = (double)exposure_.exposure * gainFromCode(exposure_.gain) *
 		       exposure_.digital * k / kWbUnity;
 	int32_t frameLines = exposureMax_ + exposureMargin_;
-	int32_t exposureSlow = (int32_t)(frameLines * kSlowFrame) - exposureMargin_;
+	int32_t exposureSlow = (int32_t)(frameLines * slowFrame_) - exposureMargin_;
 	Exposure e;
 	if (total <= exposureMax_) {
 		e = { std::max<int32_t>(100, (int32_t)total), 0, vblankDef_, kWbUnity };
