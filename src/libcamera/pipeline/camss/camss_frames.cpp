@@ -95,9 +95,16 @@ CamssFrames::Info *CamssFrames::create(Request *request)
 
 void CamssFrames::remove(CamssFrames::Info *info)
 {
-	/* Return params and stat buffer for reuse. */
-	availableParamBuffers_.push(info->paramBuffer);
-	availableStatBuffers_.push(info->statBuffer);
+	/*
+	 * Return the params and stat buffers for reuse. A frame without
+	 * them (the inline ISP has neither) must not leave a null entry
+	 * behind: init() takes a non-empty queue to mean the buffers are
+	 * required, and the next create() would dereference it.
+	 */
+	if (info->paramBuffer)
+		availableParamBuffers_.push(info->paramBuffer);
+	if (info->statBuffer)
+		availableStatBuffers_.push(info->statBuffer);
 
 	/* Delete the extended frame information. */
 	frameInfo_.erase(info->id);
