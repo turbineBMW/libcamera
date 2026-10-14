@@ -20,6 +20,7 @@
 #include <libcamera/request.h>
 #include <libcamera/stream.h>
 
+#include "libcamera/internal/bayer_format.h"
 #include "libcamera/internal/camera_sensor.h"
 #include "libcamera/internal/framebuffer.h"
 #include "libcamera/internal/request.h"
@@ -55,6 +56,23 @@ std::unique_ptr<CamssIspInline> CamssIspInline::match(CamssCsiCamera *csi,
 {
 	if (!csi->hasPix())
 		return nullptr;
+
+	/*
+	 * The IFE takes its input as RGGB, and the CSID crop turns GBRG into
+	 * it; GRBG and BGGR sensors keep the software path until the order
+	 * can be set.
+	 */
+	bool supported = false;
+	for (unsigned int code : csi->sensor()->mbusCodes()) {
+		const BayerFormat &bf = BayerFormat::fromMbusCode(code);
+		if (bf.isValid() && (bf.order == BayerFormat::RGGB || bf.order == BayerFormat::GBRG))
+			supported = true;
+	}
+	if (!supported) {
+		LOG(Camss, Info) << "Pixel path not used for " << csi->sensor()->id()
+				 << ": Bayer order not handled yet";
+		return nullptr;
+	}
 
 	auto isp = std::make_unique<CamssIspInline>(csi, frameInfos);
 	if (!isp->isValid())
