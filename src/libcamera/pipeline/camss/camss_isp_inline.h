@@ -66,7 +66,11 @@ private:
 	};
 
 	void bufferReady(FrameBuffer *buffer);
-	void runAlgorithms(FrameBuffer *buffer, unsigned int frame, ControlList &metadata);
+	void runAlgorithms(FrameBuffer *buffer, unsigned int frame);
+	void fillMetadata(ControlList &metadata) const;
+	void publishControls(ControlInfoMap *ispControls) const;
+	void updateLineDuration();
+	int32_t manualExposureMax() const;
 	void applySensor();
 	void applyIsp();
 
@@ -90,6 +94,9 @@ private:
 	int32_t exposureMargin_;
 
 	Exposure exposure_;
+	double lineDurationUs_;
+	bool aeEnabled_;
+	bool awbEnabled_;
 	int32_t wbRed_;		/* Q10 */
 	int32_t wbBlue_;
 	int32_t blackLevel_;	/* 10-bit units */

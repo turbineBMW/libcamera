@@ -18,6 +18,7 @@
 
 #include <libcamera/control_ids.h>
 #include <libcamera/formats.h>
+#include <libcamera/ipa/core_ipa_interface.h>
 #include <libcamera/request.h>
 #include <libcamera/stream.h>
 
@@ -114,9 +115,66 @@ std::unique_ptr<CamssIspInline> CamssIspInline::match(CamssCsiCamera *csi,
 	if (!isp->isValid())
 		return nullptr;
 
+	isp->publishControls(ispControls);
+
 	LOG(Camss, Info) << "Using the inline IFE pixel path for "
 			 << csi->sensor()->id();
 	return isp;
+}
+
+/*
+ * The IMX681 gain code to a multiplier and back; the sensor's unity code is
+ * zero and the response is 1024 / (1024 - code).
+ */
+static float gainFromCode(int32_t code)
+{
+	return 1024.0f / (1024.0f - std::clamp<int32_t>(code, 0, 1023));
+}
+
+static int32_t gainToCode(float gain)
+{
+	if (gain <= 1.0f)
+		return 0;
+	return std::clamp<int32_t>(std::lround(1024.0f - 1024.0f / gain), 0, 1023);
+}
+
+void CamssIspInline::updateLineDuration()
+{
+	IPACameraSensorInfo info{};
+	if (sensor_->sensorInfo(&info) == 0 && info.pixelRate && info.minLineLength)
+		lineDurationUs_ = info.minLineLength * 1e6 / info.pixelRate;
+	else
+		lineDurationUs_ = 0.0;
+}
+
+/* The longest exposure a manual setting may ask for, at the longest frame */
+int32_t CamssIspInline::manualExposureMax() const
+{
+	return exposureMax_ + (vblankMax_ - vblankDef_);
+}
+
+/*
+ * The controls applications see: the auto algorithms on or off, and the
+ * manual exposure, gain and colour gains that apply when they are off.
+ * Without any, the pipewire libcamera node is dropped by wireplumber
+ * (an empty PropInfo enumeration fails its activation).
+ */
+void CamssIspInline::publishControls(ControlInfoMap *ispControls) const
+{
+	ControlInfoMap::Map map;
+	double line = lineDurationUs_ > 0.0 ? lineDurationUs_ : 1.0;
+
+	map[&controls::AeEnable] = ControlInfo(false, true, true);
+	map[&controls::ExposureTime] =
+		ControlInfo(static_cast<int32_t>(std::lround(line)),
+			    static_cast<int32_t>(std::lround(manualExposureMax() * line)),
+			    static_cast<int32_t>(std::lround(exposure_.exposure * line)));
+	map[&controls::AnalogueGain] =
+		ControlInfo(1.0f, gainFromCode(gainMax_), 1.0f);
+	map[&controls::AwbEnable] = ControlInfo(false, true, true);
+	map[&controls::ColourGains] = ControlInfo(0.25f, 4.0f, 1.0f);
+
+	*ispControls = ControlInfoMap(std::move(map), controls::controls);
 }
 
 CamssIspInline::CamssIspInline(CamssCsiCamera *csi, CamssFrames *frameInfos)
@@ -142,6 +200,9 @@ CamssIspInline::CamssIspInline(CamssCsiCamera *csi, CamssFrames *frameInfos)
 
 	exposure_ = { exposure->second.def().get<int32_t>(),
 		      gain->second.def().get<int32_t>(), vblankDef_, kWbUnity };
+	aeEnabled_ = true;
+	awbEnabled_ = true;
+	updateLineDuration();
 	wbRed_ = kWbUnity;
 	wbBlue_ = kWbUnity;
 	blackLevel_ = kDefaultBlackLevel;
@@ -297,6 +358,7 @@ int CamssIspInline::configure(const StreamConfiguration &inputCfg,
 	exposureMax_ = inputCfg.size.height + vblankDef_ - exposureMargin_;
 	exposure_.exposure = std::min(exposure_.exposure, exposureMax_);
 	exposure_.vblank = vblankDef_;
+	updateLineDuration();
 
 	return 0;
 }
@@ -337,6 +399,50 @@ int CamssIspInline::queueRequest(Request *request)
 		LOG(Camss, Error) << "Request without an output buffer";
 		return -EINVAL;
 	}
+
+	/*
+	 * Manual exposure, gain or colour gains take the matching loop out
+	 * of the picture; an explicit AeEnable or AwbEnable in the same
+	 * request has the last word.
+	 */
+	const ControlList &ctrls = request->controls();
+	bool sensorChanged = false, ispChanged = false;
+
+	if (const auto &exp = ctrls.get(controls::ExposureTime)) {
+		if (*exp > 0 && lineDurationUs_ > 0.0) {
+			int32_t frameLines = exposureMax_ + exposureMargin_;
+			aeEnabled_ = false;
+			exposure_.exposure = std::clamp<int32_t>(std::lround(*exp / lineDurationUs_),
+								 1, manualExposureMax());
+			exposure_.vblank = std::clamp<int32_t>(exposure_.exposure + exposureMargin_ -
+							       (frameLines - vblankDef_),
+							       vblankDef_, vblankMax_);
+			exposure_.digital = kWbUnity;
+			sensorChanged = ispChanged = true;
+		}
+	}
+	if (const auto &gain = ctrls.get(controls::AnalogueGain)) {
+		aeEnabled_ = false;
+		exposure_.gain = std::min(gainToCode(*gain), gainMax_);
+		exposure_.digital = kWbUnity;
+		sensorChanged = ispChanged = true;
+	}
+	if (const auto &ae = ctrls.get(controls::AeEnable))
+		aeEnabled_ = *ae;
+
+	if (const auto &gains = ctrls.get(controls::ColourGains)) {
+		awbEnabled_ = false;
+		wbRed_ = std::clamp<int32_t>(std::lround((*gains)[0] * kWbUnity), 256, kWbMax);
+		wbBlue_ = std::clamp<int32_t>(std::lround((*gains)[1] * kWbUnity), 256, kWbMax);
+		ispChanged = true;
+	}
+	if (const auto &awb = ctrls.get(controls::AwbEnable))
+		awbEnabled_ = *awb;
+
+	if (sensorChanged)
+		applySensor();
+	if (ispChanged)
+		applyIsp();
 
 	return output_->queueBuffer(buffer);
 }
@@ -399,7 +505,7 @@ void CamssIspInline::applyIsp()
  * white balance, applied as a correction to the gains already in place
  * since the statistics are taken after them.
  */
-void CamssIspInline::runAlgorithms(FrameBuffer *buffer, unsigned int frame, ControlList &metadata)
+void CamssIspInline::runAlgorithms(FrameBuffer *buffer, unsigned int frame)
 {
 	MappedFrameBuffer map(buffer, MappedFrameBuffer::MapFlag::Read);
 	if (!map.isValid()) {
@@ -449,7 +555,11 @@ void CamssIspInline::runAlgorithms(FrameBuffer *buffer, unsigned int frame, Cont
 	double meanY = sumY / n;
 	double R = sumR / n, G = sumG / n, B = sumB / n;
 
+	if (!aeEnabled_ && !awbEnabled_)
+		return;
+
 	/* Exposure */
+	if (aeEnabled_) {
 	double k = std::pow(kTargetLuma / 255.0, 2.2) / std::max(std::pow(meanY / 255.0, 2.2), 1e-4);
 	k = std::clamp(std::pow(k, 0.6), 0.5, 2.0);
 
@@ -474,13 +584,17 @@ void CamssIspInline::runAlgorithms(FrameBuffer *buffer, unsigned int frame, Cont
 	e.vblank = std::clamp<int32_t>(e.exposure + exposureMargin_ - (frameLines - vblankDef_),
 				       vblankDef_, vblankMax_);
 	exposure_ = e;
+	}
 
 	/* White balance, incremental grey world */
+	if (awbEnabled_) {
 	double kr = G / std::max(R, 1e-4), kb = G / std::max(B, 1e-4);
 	wbRed_ = std::clamp<int32_t>(wbRed_ * std::pow(kr, 0.5), 256, kWbMax);
 	wbBlue_ = std::clamp<int32_t>(wbBlue_ * std::pow(kb, 0.5), 256, kWbMax);
+	}
 
-	applySensor();
+	if (aeEnabled_)
+		applySensor();
 	applyIsp();
 
 	if (frame % 30 == 0)
@@ -490,8 +604,16 @@ void CamssIspInline::runAlgorithms(FrameBuffer *buffer, unsigned int frame, Cont
 				  << " gain " << exposure_.gain
 				  << " digital " << exposure_.digital
 				  << " R " << wbRed_ << " B " << wbBlue_;
+}
 
-	metadata.set(controls::AnalogueGain, 1024.0f / (1024.0f - exposure_.gain));
+void CamssIspInline::fillMetadata(ControlList &metadata) const
+{
+	metadata.set(controls::AeEnable, aeEnabled_);
+	metadata.set(controls::ExposureTime,
+		     static_cast<int32_t>(std::lround(exposure_.exposure * lineDurationUs_)));
+	metadata.set(controls::AnalogueGain, gainFromCode(exposure_.gain));
+	metadata.set(controls::DigitalGain, exposure_.digital / static_cast<float>(kWbUnity));
+	metadata.set(controls::AwbEnable, awbEnabled_);
 	metadata.set(controls::ColourGains, Span<const float, 2>({ wbRed_ / 1024.0f, wbBlue_ / 1024.0f }));
 	metadata.set(controls::SensorBlackLevels,
 		     Span<const int32_t, 4>({ blackLevel_ << 6, blackLevel_ << 6, blackLevel_ << 6, blackLevel_ << 6 }));
@@ -518,9 +640,11 @@ void CamssIspInline::bufferReady(FrameBuffer *buffer)
 	 */
 	outputBufferReady.emit(buffer);
 
-	ControlList metadata(controls::controls);
 	if (ok && (frameCount_++ % 4) == 0)
-		runAlgorithms(buffer, frame, metadata);
+		runAlgorithms(buffer, frame);
+
+	ControlList metadata(controls::controls);
+	fillMetadata(metadata);
 	metadataReady.emit(frame, metadata);
 }
 
