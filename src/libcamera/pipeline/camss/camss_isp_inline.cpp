@@ -9,11 +9,17 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
+#include <filesystem>
+#include <string>
+#include <vector>
 
 #include <linux/media-bus-format.h>
+#include <linux/qcom-camss-controls.h>
 #include <linux/v4l2-controls.h>
 #include <linux/videodev2.h>
 
+#include <libcamera/base/file.h>
 #include <libcamera/base/log.h>
 
 #include <libcamera/control_ids.h>
@@ -28,6 +34,7 @@
 #include "libcamera/internal/request.h"
 #include "libcamera/internal/mapped_framebuffer.h"
 #include "libcamera/internal/media_device.h"
+#include "libcamera/internal/yaml_parser.h"
 
 #include "camss_csi.h"
 #include "camss_frames.h"
@@ -44,11 +51,32 @@ constexpr int32_t kWbUnity = 1024;
 constexpr int32_t kWbMax = 4096;
 constexpr int32_t kDigitalMax = 4096;
 /* Loop tuning: target luma, damping, and where to trade frame rate for gain */
-constexpr double kTargetLuma = 110.0;
+constexpr double kTargetLuma = 120.0;
+constexpr double kCentreWeight = 3.0;	/* weight of the central quarter of the frame */
 constexpr int32_t kGainKnee = 768;	/* IMX681 code for 4x */
 constexpr double kSlowFrame = 2.0;	/* allow frames up to twice as long in the dark */
 constexpr unsigned int kStatsStep = 16;
 constexpr int32_t kDefaultBlackLevel = 64;
+
+/*
+ * A tone curve with a linear toe: slope \a toe up to \a knee, then a
+ * power curve of exponent 1/\a gamma that meets it there and ends at 1.
+ * The driver's LUT takes 256 twelve-bit outputs indexed by the top eight
+ * bits of the input.
+ */
+std::array<uint16_t, 256> toneCurve(double toe, double knee, double gamma)
+{
+	std::array<uint16_t, 256> lut;
+	double a = (1.0 - toe * knee) / (1.0 - std::pow(knee, 1.0 / gamma));
+
+	for (unsigned int i = 0; i < lut.size(); i++) {
+		double x = i / 255.0;
+		double y = x < knee ? toe * x : a * std::pow(x, 1.0 / gamma) - (a - 1.0);
+		lut[i] = static_cast<uint16_t>(std::lround(std::clamp(y, 0.0, 1.0) * 4095.0));
+	}
+
+	return lut;
+}
 
 } /* namespace */
 
@@ -206,9 +234,101 @@ CamssIspInline::CamssIspInline(CamssCsiCamera *csi, CamssFrames *frameInfos)
 	wbRed_ = kWbUnity;
 	wbBlue_ = kWbUnity;
 	blackLevel_ = kDefaultBlackLevel;
+	targetLuma_ = kTargetLuma;
+	centreWeight_ = kCentreWeight;
+	awbRedBias_ = 1.0;
+	awbBlueBias_ = 1.0;
+	loadTuning();
 
 	output_->bufferReady.connect(this, &CamssIspInline::bufferReady);
 	valid_ = true;
+}
+
+/*
+ * Per-sensor tuning, optional: $LIBCAMERA_CAMSS_TUNING or
+ * <sysconfdir>/libcamera/camss/<sensor model>.yaml:
+ *
+ *   version: 1
+ *   ae: { target: 120, centre_weight: 3 }
+ *   awb: { red_bias: 1.0, blue_bias: 0.95 }    # leave some of the illuminant in
+ *   gamma: { toe: 2.6, knee: 0.17, gamma: 2.9 }   # or gamma_lut: [256 x 0..4095]
+ *   ccm: [r_r, r_g, r_b, g_r, g_g, g_b, b_r, b_g, b_b]   # row-major, 1.0 unity
+ *   ccm_strength: 1.0                                   # blend towards identity
+ *   ccm_offsets: [r, g, b]                              # fraction of full scale
+ *
+ * Without a file the loop keeps its defaults and the driver its own curve
+ * and identity matrix.
+ */
+void CamssIspInline::loadTuning()
+{
+	std::string path;
+	const char *env = std::getenv("LIBCAMERA_CAMSS_TUNING");
+	if (env && *env) {
+		path = env;
+	} else {
+		path = (std::filesystem::path(LIBCAMERA_SYSCONF_DIR) / "camss" /
+			(sensor_->model() + ".yaml")).string();
+	}
+
+	File file(path);
+	if (!file.exists())
+		return;
+	if (!file.open(File::OpenModeFlag::ReadOnly)) {
+		LOG(Camss, Warning) << "Cannot open tuning file " << path;
+		return;
+	}
+
+	std::unique_ptr<ValueNode> root = YamlParser::parse(file);
+	if (!root) {
+		LOG(Camss, Warning) << "Cannot parse tuning file " << path;
+		return;
+	}
+
+	const ValueNode &ae = (*root)["ae"];
+	targetLuma_ = ae["target"].get<double>().value_or(kTargetLuma);
+	centreWeight_ = ae["centre_weight"].get<double>().value_or(kCentreWeight);
+	const ValueNode &awb = (*root)["awb"];
+	awbRedBias_ = awb["red_bias"].get<double>().value_or(1.0);
+	awbBlueBias_ = awb["blue_bias"].get<double>().value_or(1.0);
+
+	if (root->contains("gamma_lut")) {
+		auto values = (*root)["gamma_lut"].get<std::vector<uint32_t>>();
+		if (values && values->size() == 256) {
+			std::array<uint16_t, 256> lut;
+			for (unsigned int i = 0; i < 256; i++)
+				lut[i] = std::min<uint32_t>((*values)[i], QCOM_CAMSS_GAMMA_LUT_MAX);
+			gammaLut_ = lut;
+		} else {
+			LOG(Camss, Warning) << "gamma_lut needs 256 entries";
+		}
+	} else if (root->contains("gamma")) {
+		const ValueNode &g = (*root)["gamma"];
+		gammaLut_ = toneCurve(g["toe"].get<double>().value_or(1.0),
+				      g["knee"].get<double>().value_or(0.0),
+				      g["gamma"].get<double>().value_or(2.2));
+	}
+
+	if (root->contains("ccm")) {
+		auto m = (*root)["ccm"].get<std::vector<double>>();
+		auto k = (*root)["ccm_offsets"].get<std::vector<double>>();
+		double strength = (*root)["ccm_strength"].get<double>().value_or(1.0);
+		if (m && m->size() == 9) {
+			std::array<int32_t, 12> ccm{};
+			for (unsigned int i = 0; i < 9; i++) {
+				double identity = i % 4 == 0 ? 1.0 : 0.0;
+				double v = identity + strength * ((*m)[i] - identity);
+				ccm[i] = std::lround(v * QCOM_CAMSS_CCM_UNITY);
+			}
+			for (unsigned int i = 0; i < 3; i++)
+				ccm[9 + i] = (k && k->size() == 3) ? std::lround((*k)[i] * 4095.0) : 0;
+			ccm_ = ccm;
+		} else {
+			LOG(Camss, Warning) << "ccm needs 9 coefficients";
+		}
+	}
+
+	LOG(Camss, Info) << "Tuning from " << path << ": target " << targetLuma_
+			 << (gammaLut_ ? ", gamma curve" : "") << (ccm_ ? ", colour matrix" : "");
 }
 
 CamssIspInline::~CamssIspInline() = default;
@@ -456,6 +576,7 @@ void CamssIspInline::processStats([[maybe_unused]] const uint32_t frame,
 int CamssIspInline::start()
 {
 	frameCount_ = 0;
+	applyTables();
 	applyIsp();
 	applySensor();
 
@@ -485,6 +606,20 @@ void CamssIspInline::applySensor()
 	ctrls.set(V4L2_CID_EXPOSURE, exposure_.exposure);
 	ctrls.set(V4L2_CID_ANALOGUE_GAIN, exposure_.gain);
 	setSensorControls.emit(ctrls);
+}
+
+/* The gamma curve and colour matrix from the tuning, on drivers that take them */
+void CamssIspInline::applyTables()
+{
+	const ControlInfoMap &info = pix_->controls();
+	ControlList ctrls(info);
+
+	if (gammaLut_ && info.find(V4L2_CID_QCOM_CAMSS_GAMMA_LUT) != info.end())
+		ctrls.set(V4L2_CID_QCOM_CAMSS_GAMMA_LUT, Span<const uint16_t>(*gammaLut_));
+	if (ccm_ && info.find(V4L2_CID_QCOM_CAMSS_CCM) != info.end())
+		ctrls.set(V4L2_CID_QCOM_CAMSS_CCM, Span<const int32_t>(*ccm_));
+	if (!ctrls.empty() && pix_->setControls(&ctrls) < 0)
+		LOG(Camss, Warning) << "Cannot set the tuning tables";
 }
 
 void CamssIspInline::applyIsp()
@@ -532,17 +667,26 @@ void CamssIspInline::runAlgorithms(FrameBuffer *buffer, unsigned int frame)
 		}
 	}
 
-	double sumY = 0, sumR = 0, sumG = 0, sumB = 0;
+	/*
+	 * Centre-weighted: the middle half of the frame in each direction,
+	 * where a face usually is, counts centreWeight_ times as much as the
+	 * rest. The colour sums stay unweighted; the walls are grey more
+	 * often than the face.
+	 */
+	double sumY = 0, sumR = 0, sumG = 0, sumB = 0, sumW = 0;
 	unsigned int n = 0;
 	for (unsigned int ry = 0; ry + 1 < h; ry += kStatsStep) {
 		for (unsigned int rx = 0; rx + 1 < w; rx += kStatsStep) {
 			double Y = y[ry * stride_ + rx];
+			bool centre = rx >= w / 4 && rx < w * 3 / 4 && ry >= h / 4 && ry < h * 3 / 4;
+			double wgt = centre ? centreWeight_ : 1.0;
 			const uint8_t *cp = c + (ry / 2) * stride_ + (rx / 2) * 2;
 			double cb = cp[0] - 128.0, cr = cp[1] - 128.0;
 			double r = std::clamp(Y + 1.402 * cr, 0.0, 255.0);
 			double g = std::clamp(Y - 0.344 * cb - 0.714 * cr, 0.0, 255.0);
 			double b = std::clamp(Y + 1.772 * cb, 0.0, 255.0);
-			sumY += Y;
+			sumY += wgt * Y;
+			sumW += wgt;
 			sumR += std::pow(r / 255.0, 2.2);
 			sumG += std::pow(g / 255.0, 2.2);
 			sumB += std::pow(b / 255.0, 2.2);
@@ -552,7 +696,7 @@ void CamssIspInline::runAlgorithms(FrameBuffer *buffer, unsigned int frame)
 	if (!n)
 		return;
 
-	double meanY = sumY / n;
+	double meanY = sumY / sumW;
 	double R = sumR / n, G = sumG / n, B = sumB / n;
 
 	if (!aeEnabled_ && !awbEnabled_)
@@ -560,7 +704,7 @@ void CamssIspInline::runAlgorithms(FrameBuffer *buffer, unsigned int frame)
 
 	/* Exposure */
 	if (aeEnabled_) {
-	double k = std::pow(kTargetLuma / 255.0, 2.2) / std::max(std::pow(meanY / 255.0, 2.2), 1e-4);
+	double k = std::pow(targetLuma_ / 255.0, 2.2) / std::max(std::pow(meanY / 255.0, 2.2), 1e-4);
 	k = std::clamp(std::pow(k, 0.6), 0.5, 2.0);
 
 	/*
@@ -596,7 +740,8 @@ void CamssIspInline::runAlgorithms(FrameBuffer *buffer, unsigned int frame)
 
 	/* White balance, incremental grey world */
 	if (awbEnabled_) {
-	double kr = G / std::max(R, 1e-4), kb = G / std::max(B, 1e-4);
+	double kr = awbRedBias_ * G / std::max(R, 1e-4);
+	double kb = awbBlueBias_ * G / std::max(B, 1e-4);
 	wbRed_ = std::clamp<int32_t>(wbRed_ * std::pow(kr, 0.5), 256, kWbMax);
 	wbBlue_ = std::clamp<int32_t>(wbBlue_ * std::pow(kb, 0.5), 256, kWbMax);
 	}

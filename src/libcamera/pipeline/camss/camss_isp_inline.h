@@ -7,7 +7,9 @@
 
 #pragma once
 
+#include <array>
 #include <memory>
+#include <optional>
 #include <vector>
 
 #include "libcamera/internal/v4l2_subdevice.h"
@@ -65,6 +67,7 @@ private:
 		int32_t digital;	/* Q10 */
 	};
 
+	void loadTuning();
 	void bufferReady(FrameBuffer *buffer);
 	void runAlgorithms(FrameBuffer *buffer, unsigned int frame);
 	void fillMetadata(ControlList &metadata) const;
@@ -73,6 +76,7 @@ private:
 	int32_t manualExposureMax() const;
 	void applySensor();
 	void applyIsp();
+	void applyTables();
 
 	CamssCsiCamera *csi_;
 	const CameraSensor *sensor_;
@@ -101,6 +105,14 @@ private:
 	int32_t wbBlue_;
 	int32_t blackLevel_;	/* 10-bit units */
 	unsigned int frameCount_;
+
+	/* tuning: exposure target, and the tables the PIX line takes */
+	double targetLuma_;
+	double centreWeight_;
+	double awbRedBias_;	/* multipliers on the grey-world gains */
+	double awbBlueBias_;
+	std::optional<std::array<uint16_t, 256>> gammaLut_;
+	std::optional<std::array<int32_t, 12>> ccm_;
 };
 
 } /* namespace libcamera */
