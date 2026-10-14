@@ -4,6 +4,7 @@ libcamera_internal_sources += files([
     'camss.cpp',
     'camss_csi.cpp',
     'camss_denoise.cpp',
+    'camss_spatial.cpp',
     'camss_frames.cpp',
     'camss_isp.cpp',
     'camss_isp_inline.cpp',

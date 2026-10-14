@@ -18,6 +18,7 @@
 
 #include "camss_denoise.h"
 #include "camss_isp.h"
+#include "camss_spatial.h"
 
 namespace libcamera {
 
@@ -125,8 +126,12 @@ private:
 	std::optional<std::array<int32_t, 12>> ccm_;
 	std::optional<std::vector<uint16_t>> lscMesh_;
 	CamssDenoise::Params denoiseParams_;
+	CamssSpatial::Params spatialParams_;
+	double spatialMinNoise_;	/* below this luma noise the spatial stage rests */
+	bool spatialActive_;
 
 	CamssDenoise denoise_;
+	CamssSpatial spatial_;
 	std::map<FrameBuffer *, std::unique_ptr<MappedFrameBuffer>> maps_;
 };
 

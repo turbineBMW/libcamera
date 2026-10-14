@@ -127,6 +127,12 @@ void CamssDenoise::regional()
 /*
  * The noise of each measure from the median of its magnitude over a
  * sample of the blocks: sigma = 1.4826 median for a still picture.
+ *
+ * When the whole picture moves (the tablet in a hand, a pan) the median
+ * is movement, not noise, and taking it would call everything still and
+ * smear the frames together. So the estimates fall freely but rise by
+ * at most 2% a frame: movement cannot inflate them, while a real rise in
+ * noise as the light fades is followed within a second or two.
  */
 void CamssDenoise::estimateNoise()
 {
@@ -156,9 +162,16 @@ void CamssDenoise::estimateNoise()
 		return 1.4826 * (m + 0.5);
 	};
 
-	sigmaBlock_ = median(hb) * 16;
-	sigmaRegion_ = median(hr) * 4;
-	sigmaChroma_ = median(hc) * 4;
+	auto track = [this](double &sigma, double measured) {
+		if (!tracked_ || measured <= sigma)
+			sigma = measured;
+		else
+			sigma = std::min(measured, sigma * 1.02);
+	};
+	track(sigmaBlock_, median(hb) * 16);
+	track(sigmaRegion_, median(hr) * 4);
+	track(sigmaChroma_, median(hc) * 4);
+	tracked_ = true;
 }
 
 /* Score each block in sigmas, look up its weight, and spread the weights 3x3 */

@@ -42,7 +42,7 @@ public:
 	};
 
 	void configure(const Size &size, unsigned int stride, const Params &params);
-	void reset() { primed_ = false; }
+	void reset() { primed_ = false; tracked_ = false; }
 	bool enabled() const { return params_.enabled; }
 	void process(uint8_t *y, uint8_t *uv);
 	double sigma() const { return sigmaBlock_ / 64.0; }	/* levels, block mean */
@@ -73,6 +73,7 @@ private:
 	std::vector<uint16_t> pixW_;
 
 	double sigmaBlock_ = 256.0, sigmaRegion_ = 64.0, sigmaChroma_ = 64.0;
+	bool tracked_ = false;	/* the sigmas hold a measurement */
 	std::array<uint16_t, 256> weights_;	/* Q8, by score in sixteenths of a sigma */
 
 	/* chroma blur */

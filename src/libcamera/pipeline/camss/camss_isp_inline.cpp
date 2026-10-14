@@ -254,6 +254,8 @@ CamssIspInline::CamssIspInline(CamssCsiCamera *csi, CamssFrames *frameInfos)
 	blackLevel_ = kDefaultBlackLevel;
 	targetLuma_ = kTargetLuma;
 	zoom_ = 1.0;
+	spatialMinNoise_ = 1.5;
+	spatialActive_ = true;
 	centreWeight_ = kCentreWeight;
 	slowFrame_ = kSlowFrame;
 	awbRedBias_ = 1.0;
@@ -281,6 +283,8 @@ CamssIspInline::CamssIspInline(CamssCsiCamera *csi, CamssFrames *frameInfos)
  *   lsc_strength: 1.0                                   # blend towards unity, 0 = block off
  *   lsc_response: [a, b]                                # applied = a g^2 + b g + (1 - a - b)
  *   denoise: { enable: true, temporal: 0.2, threshold: 2.5, ramp: 2.0, chroma_radius: 2 }
+ *   spatial: { enable: true, luma: [4 per level], chroma: [4], luma_ratios: [4],
+ *              chroma_ratios: [4], threads: 4, min_noise: 1.5 }   # runs before denoise
  *
  * Without a file the loop keeps its defaults and the driver its own curve
  * and identity matrix.
@@ -326,6 +330,25 @@ void CamssIspInline::loadTuning()
 	denoiseParams_.threshold = dn["threshold"].get<double>().value_or(denoiseParams_.threshold);
 	denoiseParams_.ramp = dn["ramp"].get<double>().value_or(denoiseParams_.ramp);
 	denoiseParams_.chromaRadius = dn["chroma_radius"].get<uint32_t>().value_or(denoiseParams_.chromaRadius);
+
+	const ValueNode &sp = (*root)["spatial"];
+	spatialParams_.enabled = sp["enable"].get<bool>().value_or(spatialParams_.enabled);
+	spatialParams_.threads = sp["threads"].get<uint32_t>().value_or(spatialParams_.threads);
+	spatialMinNoise_ = sp["min_noise"].get<double>().value_or(spatialMinNoise_);
+	auto levels = [&](const char *key, std::array<double, CamssSpatial::kLevels> &out) {
+		auto v = sp[key].get<std::vector<double>>();
+		if (!v)
+			return;
+		if (v->size() != out.size()) {
+			LOG(Camss, Warning) << "spatial." << key << " needs " << out.size() << " values";
+			return;
+		}
+		std::copy(v->begin(), v->end(), out.begin());
+	};
+	levels("luma", spatialParams_.luma);
+	levels("chroma", spatialParams_.chroma);
+	levels("luma_ratios", spatialParams_.lumaRatios);
+	levels("chroma_ratios", spatialParams_.chromaRatios);
 
 	if (root->contains("gamma_lut")) {
 		auto values = (*root)["gamma_lut"].get<std::vector<uint32_t>>();
@@ -408,7 +431,8 @@ void CamssIspInline::loadTuning()
 	LOG(Camss, Info) << "Tuning from " << path << ": target " << targetLuma_
 			 << (gammaLut_ ? ", gamma curve" : "") << (ccm_ ? ", colour matrix" : "")
 			 << (lscMesh_ ? ", shading mesh" : "")
-			 << (denoiseParams_.enabled ? ", denoise" : "");
+			 << (spatialParams_.enabled ? ", spatial denoise" : "")
+			 << (denoiseParams_.enabled ? ", temporal denoise" : "");
 }
 
 CamssIspInline::~CamssIspInline() = default;
@@ -552,6 +576,8 @@ int CamssIspInline::configure(const StreamConfiguration &inputCfg,
 	stride_ = fmt.planes[0].bpl;
 	bufferCount_ = outputCfg.bufferCount;
 	denoise_.configure(size_, stride_, denoiseParams_);
+	spatial_.configure(size_, stride_, spatialParams_);
+	spatialActive_ = true;
 
 	/*
 	 * The exposure limit follows the frame length the sensor currently
@@ -787,16 +813,31 @@ void CamssIspInline::denoise(FrameBuffer *buffer, unsigned int frame)
 	struct dma_buf_sync sync = { DMA_BUF_SYNC_START | DMA_BUF_SYNC_RW };
 	ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync);
 
+	/*
+	 * The spatial stage first, so the temporal one sees a cleaner frame
+	 * and can tell movement from noise more finely. In good light the
+	 * spatial stage has little to remove; it then rests and looks again
+	 * every 30 frames.
+	 */
 	auto t0 = std::chrono::steady_clock::now();
-	denoise_.process(y, c);
+	if (spatial_.enabled() && (spatialActive_ || frame % 30 == 0)) {
+		spatial_.process(y, c);
+		spatialActive_ = spatial_.lumaSigma() >= spatialMinNoise_;
+	}
 	auto t1 = std::chrono::steady_clock::now();
+	if (denoise_.enabled())
+		denoise_.process(y, c);
+	auto t2 = std::chrono::steady_clock::now();
 
 	sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_RW;
 	ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync);
+	using ms = std::chrono::duration<double, std::milli>;
 	if (frame % 30 == 0)
-		LOG(Camss, Debug) << "denoise " << size_ << " in "
-				  << std::chrono::duration<double, std::milli>(t1 - t0).count()
-				  << " ms, noise " << denoise_.sigma() << " levels";
+		LOG(Camss, Debug) << "denoise " << size_ << ": spatial "
+				  << (spatialActive_ ? "" : "resting, ") << ms(t1 - t0).count()
+				  << " ms, noise " << spatial_.lumaSigma() << "/" << spatial_.chromaSigma()
+				  << "; temporal " << ms(t2 - t1).count() << " ms, noise "
+				  << denoise_.sigma();
 }
 
 /*
@@ -940,7 +981,7 @@ void CamssIspInline::bufferReady(FrameBuffer *buffer)
 	 * Every fourth frame feeds the loop; the controls land within a frame
 	 * or two.
 	 */
-	if (ok && denoise_.enabled())
+	if (ok && (denoise_.enabled() || spatial_.enabled()))
 		denoise(buffer, frame);
 
 	outputBufferReady.emit(buffer);
