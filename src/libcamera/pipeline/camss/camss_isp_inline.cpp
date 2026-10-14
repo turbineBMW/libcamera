@@ -56,6 +56,8 @@ constexpr double kCentreWeight = 3.0;	/* weight of the central quarter of the fr
 constexpr int32_t kGainKnee = 768;	/* IMX681 code for 4x */
 constexpr double kSlowFrame = 2.0;	/* allow frames up to twice as long in the dark */
 constexpr unsigned int kStatsStep = 16;
+constexpr double kAwbClip = 235.0;	/* samples above this in any channel are clipped */
+constexpr double kAwbFloor = 12.0;	/* and below this in luma are noise */
 constexpr int32_t kDefaultBlackLevel = 64;
 
 /*
@@ -734,6 +736,13 @@ void CamssIspInline::runAlgorithms(FrameBuffer *buffer, unsigned int frame)
 			double b = std::clamp(Y + 1.772 * cb, 0.0, 255.0);
 			sumY += wgt * Y;
 			sumW += wgt;
+			/*
+			 * Clipped pixels read as grey whatever their colour and
+			 * near-black ones carry little but noise; neither says
+			 * anything about the illuminant.
+			 */
+			if (std::max({ r, g, b }) > kAwbClip || Y < kAwbFloor)
+				continue;
 			sumR += std::pow(r / 255.0, 2.2);
 			sumG += std::pow(g / 255.0, 2.2);
 			sumB += std::pow(b / 255.0, 2.2);
