@@ -38,6 +38,7 @@
 #include "camss_csi.h"
 #include "camss_frames.h"
 #include "camss_isp.h"
+#include "camss_isp_inline.h"
 #include "camss_isp_ope.h"
 #include "camss_isp_soft.h"
 
@@ -181,6 +182,11 @@ CameraConfiguration::Status CamssCameraConfiguration::validate()
 		 */
 		LOG(Camss, Debug)
 			<< "Camera configuration cannot support raw-only streams";
+		return Invalid;
+	}
+
+	if (rawCount && data_->isp_->isInline()) {
+		LOG(Camss, Debug) << "Raw streams not supported with the inline ISP";
 		return Invalid;
 	}
 
@@ -460,6 +466,16 @@ void CamssCameraData::queuePendingRequests()
 		 * provided in the request, if any, or a CIO2 internal buffer
 		 * otherwise.
 		 */
+		if (isp_->isInline()) {
+			if (isp_->queueRequest(request)) {
+				frameInfos_.remove(info);
+				break;
+			}
+			info->rawBuffer = nullptr;
+			pendingRequests_.pop();
+			continue;
+		}
+
 		FrameBuffer *reqRawBuffer = request->findBuffer(&csi_->rawStream_);
 		FrameBuffer *rawBuffer = csi_->queueBuffer(request, reqRawBuffer);
 		/*
@@ -523,9 +539,15 @@ bool PipelineHandlerCamss::match(DeviceEnumerator *enumerator)
 		data->delayedCtrls_ =
 			std::make_unique<DelayedControls>(sensor->device(), params);
 
-		data->isp_ = CamssIspOpe::match(this, enumerator, sensor,
-						&data->frameInfos_,
-						&data->controlInfo_);
+		data->isp_ = CamssIspInline::match(data->csi_.get(),
+						   &data->frameInfos_,
+						   &data->controlInfo_);
+		if (data->isp_)
+			data->csi_->setRawCapture(false);
+		else
+			data->isp_ = CamssIspOpe::match(this, enumerator, sensor,
+							&data->frameInfos_,
+							&data->controlInfo_);
 		if (data->isp_ == nullptr) {
 			data->isp_ =
 				std::make_unique<CamssIspSoft>(this, sensor,

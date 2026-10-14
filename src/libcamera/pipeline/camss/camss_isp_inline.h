@@ -1,0 +1,99 @@
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
+/*
+ * Copyright (C) 2026 Brandon Williams
+ *
+ * camss_isp_inline.h - Inline IFE ISP: NV12 straight from the pixel path
+ */
+
+#pragma once
+
+#include <memory>
+#include <vector>
+
+#include "libcamera/internal/v4l2_subdevice.h"
+#include "libcamera/internal/v4l2_videodevice.h"
+
+#include "camss_isp.h"
+
+namespace libcamera {
+
+class CamssCsiCamera;
+class CamssFrames;
+class CameraSensor;
+class ControlInfoMap;
+
+/*
+ * The CAMSS driver's PIX line: the CSID's pixel port feeds the IFE's image
+ * pipeline, which writes NV12 to the msm_vfe%d_pix video node. The driver
+ * programs the modules; this class owns the video node and the PIX subdev's
+ * controls (white balance gains, digital gain, black level) and runs auto
+ * exposure and white balance on statistics taken from the output frames.
+ */
+class CamssIspInline : public CamssIsp
+{
+public:
+	static std::unique_ptr<CamssIspInline> match(CamssCsiCamera *csi,
+						     CamssFrames *frameInfos,
+						     ControlInfoMap *ispControls);
+
+	CamssIspInline(CamssCsiCamera *csi, CamssFrames *frameInfos);
+	~CamssIspInline() override;
+
+	bool isValid() override { return valid_; }
+	bool isInline() const override { return true; }
+	Size getMargins(PixelFormat inputFormat) override;
+	StreamConfiguration generateConfiguration(const StreamConfiguration &raw) const override;
+	StreamConfiguration validate(const StreamConfiguration &raw, const StreamConfiguration &req) const override;
+	int configure(const StreamConfiguration &inputCfg,
+		      const StreamConfiguration &outputCfg) override;
+	int allocateBuffers(unsigned int bufferCount) override;
+	void freeBuffers() override;
+	int exportOutputBuffers(const Stream *stream, unsigned int count,
+				std::vector<std::unique_ptr<FrameBuffer>> *buffers) override;
+	void queueBuffers(Request *request, FrameBuffer *input) override;
+	int queueRequest(Request *request) override;
+	void processStats(const uint32_t frame, const uint32_t statsBufferId,
+			  const ControlList &sensorControls) override;
+	int start() override;
+	void stop() override;
+
+private:
+	struct Exposure {
+		int32_t exposure;
+		int32_t gain;
+		int32_t vblank;
+		int32_t digital;	/* Q10 */
+	};
+
+	void bufferReady(FrameBuffer *buffer);
+	void runAlgorithms(FrameBuffer *buffer, unsigned int frame, ControlList &metadata);
+	void applySensor();
+	void applyIsp();
+
+	CamssCsiCamera *csi_;
+	const CameraSensor *sensor_;
+	V4L2Subdevice *pix_;
+	V4L2VideoDevice *output_;
+	CamssFrames *frameInfos_;
+	bool valid_;
+
+	Size size_;
+	unsigned int stride_;
+	unsigned int bufferCount_;
+
+	/* sensor control ranges */
+	int32_t exposureMax_;
+	int32_t gainMax_;
+	int32_t vblankMin_;
+	int32_t vblankMax_;
+	int32_t vblankDef_;
+	int32_t exposureMargin_;
+
+	Exposure exposure_;
+	int32_t wbRed_;		/* Q10 */
+	int32_t wbBlue_;
+	int32_t blackLevel_;	/* 10-bit units */
+	unsigned int frameCount_;
+};
+
+} /* namespace libcamera */

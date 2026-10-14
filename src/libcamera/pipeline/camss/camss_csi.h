@@ -51,6 +51,14 @@ public:
 	unsigned int PixelFormatToMbusCode(const PixelFormat &format) const;
 
 	void setIsp(CamssIsp *isp) { isp_ = isp; }
+	/* Raw capture through the RDI is off when an inline ISP owns the output */
+	void setRawCapture(bool enable) { rawCapture_ = enable; }
+	/* The pixel path (IFE PIX line), present on SoCs whose camss exposes it */
+	bool hasPix() const { return pixLink_ != nullptr; }
+	MediaLink *pixLink() { return pixLink_; }
+	V4L2Subdevice *csidSubdev() { return links_[PhyCsidLink].sinkSubdev.get(); }
+	V4L2Subdevice *pixSubdev() { return pixSubdev_.get(); }
+	V4L2VideoDevice *pixOutput() { return pixOutput_.get(); }
 
 	int start();
 	void stop();
@@ -98,6 +106,10 @@ private:
 
 	std::unique_ptr<CameraSensor> sensor_;
 	std::unique_ptr<V4L2VideoDevice> output_;
+	MediaLink *pixLink_ = nullptr;
+	std::unique_ptr<V4L2Subdevice> pixSubdev_;
+	std::unique_ptr<V4L2VideoDevice> pixOutput_;
+	bool rawCapture_ = true;
 	std::array<linkInfo, LinkCount> links_;
 	CamssIsp *isp_;
 

@@ -7,6 +7,7 @@
 
 #pragma once
 
+#include <errno.h>
 #include <stdint.h>
 #include <vector>
 
@@ -41,6 +42,13 @@ public:
 					[[maybe_unused]] unsigned int count,
 					[[maybe_unused]] std::vector<std::unique_ptr<FrameBuffer>> *buffers) { return 0; }
 	virtual void queueBuffers(Request *request, FrameBuffer *input) = 0;
+	/*
+	 * An inline ISP captures its output straight from the hardware
+	 * pipeline instead of processing a raw buffer: the pipeline handler
+	 * queues requests to it and never streams the raw receiver.
+	 */
+	virtual bool isInline() const { return false; }
+	virtual int queueRequest([[maybe_unused]] Request *request) { return -ENOTSUP; }
 
 	virtual void processStats(const uint32_t frame, const uint32_t statsBufferId,
 				  const ControlList &sensorControls) = 0;

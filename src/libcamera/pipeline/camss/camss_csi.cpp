@@ -10,6 +10,9 @@
  * Copyright (C) 2019, Google Inc.
  */
 
+#include <algorithm>
+#include <cstdlib>
+
 #include "camss_csi.h"
 
 #include <cmath>
@@ -301,12 +304,17 @@ int CamssCsiCamera::configure(const StreamConfiguration &cfg, const Transform &t
 	if (ret)
 		return ret;
 
-	for (auto &link : links_) {
-		if (!(link.link->flags() & MEDIA_LNK_FL_ENABLED)) {
-			ret = link.link->setEnabled(true);
+	for (unsigned int i = 0; i < LinkCount; i++) {
+		auto &link = links_[i];
+		bool enable = rawCapture_ || i != CsidVfeLink;
+
+		if (enable != !!(link.link->flags() & MEDIA_LNK_FL_ENABLED)) {
+			ret = link.link->setEnabled(enable);
 			if (ret)
 				return ret;
 		}
+		if (!enable)
+			continue;
 
 		MediaPad *sink = link.link->sink();
 		ret = link.sinkSubdev->setFormat(sink->index(), &sensorFormat,
@@ -314,6 +322,10 @@ int CamssCsiCamera::configure(const StreamConfiguration &cfg, const Transform &t
 		if (ret)
 			return ret;
 	}
+
+	bufferCount_ = cfg.bufferCount;
+	if (!rawCapture_)
+		return 0;
 
 	outputFormat.fourcc = mbusCodeToV4L2PixelFormat(sensorFormat.code);
 	outputFormat.size = sensorFormat.size;
@@ -327,8 +339,6 @@ int CamssCsiCamera::configure(const StreamConfiguration &cfg, const Transform &t
 	if (!camssV4L2DeviceFormatMatchesStreamConfig(outputFormat, cfg, "CSI configure"))
 		return -EIO; /* Must match the tryFormat() from validate() */
 
-	bufferCount_ = cfg.bufferCount;
-
 	return 0;
 }
 
@@ -340,6 +350,9 @@ int CamssCsiCamera::exportBuffers(unsigned int count,
 
 int CamssCsiCamera::start()
 {
+	if (!rawCapture_)
+		return 0;
+
 	int ret = output_->exportBuffers(bufferCount_, &buffers_);
 	if (ret < 0)
 		return ret;
@@ -362,6 +375,9 @@ int CamssCsiCamera::start()
 
 void CamssCsiCamera::stop()
 {
+	if (!rawCapture_)
+		return;
+
 	if (output_->streamOff())
 		LOG(Camss, Error) << "CamssCsi stream off failed";
 
@@ -514,8 +530,55 @@ std::unique_ptr<CamssCsiCamera> CamssCsi::enumCamera(MediaEntity *phy)
 		return nullptr;
 	}
 
-	MediaEntity *csid = csids_.front();
-	MediaEntity *vfe = vfes_.front();
+	/*
+	 * Full VFEs carry the IFE pixel path (a msm_vfe%d_pix sibling), lite
+	 * ones only RDIs. Colour sensors want a pixel path; a mono sensor is
+	 * as well served by a lite VFE, so leave the full ones to the others.
+	 */
+	bool bayer = false;
+	for (unsigned int code : cam->sensor_->mbusCodes()) {
+		const BayerFormat &bf = BayerFormat::fromMbusCode(code);
+		if (bf.isValid() && bf.order != BayerFormat::MONO)
+			bayer = true;
+	}
+	auto hasPix = [this](MediaEntity *v) {
+		std::string name = v->name();
+		size_t pos = name.rfind("_rdi");
+		return pos != std::string::npos &&
+		       camssMediaDev_->getEntityByName(name.substr(0, pos) + "_pix") != nullptr;
+	};
+	auto vfeIt = std::find_if(vfes_.begin(), vfes_.end(),
+				  [&](MediaEntity *v) { return hasPix(v) == bayer; });
+	if (vfeIt == vfes_.end())
+		vfeIt = vfes_.begin();
+	MediaEntity *vfe = *vfeIt;
+
+	/*
+	 * The pixel path only runs between a CSID and the VFE of the same
+	 * index (the media graph offers more links than the hardware honours),
+	 * so take that CSID when there is a pixel path; any CSID otherwise.
+	 */
+	auto index = [](MediaEntity *e) {
+		std::string name = e->name();
+		size_t pos = name.find_first_of("0123456789");
+		return pos == std::string::npos ? -1 : std::atoi(name.c_str() + pos);
+	};
+	auto csidIt = csids_.end();
+	if (hasPix(vfe)) {
+		int vfeIndex = index(vfe);
+		csidIt = std::find_if(csids_.begin(), csids_.end(),
+				      [&](MediaEntity *c) { return index(c) == vfeIndex; });
+	} else {
+		/* leave the CSIDs that pixel-path VFEs still waiting will need */
+		csidIt = std::find_if(csids_.begin(), csids_.end(), [&](MediaEntity *c) {
+			return std::none_of(vfes_.begin(), vfes_.end(), [&](MediaEntity *v) {
+				return v != vfe && hasPix(v) && index(v) == index(c);
+			});
+		});
+	}
+	if (csidIt == csids_.end())
+		csidIt = csids_.begin();
+	MediaEntity *csid = *csidIt;
 
 	for (unsigned int i = 0; i < CamssCsiCamera::LinkCount; i++) {
 		auto &link = cam->links_[i];
@@ -556,14 +619,39 @@ std::unique_ptr<CamssCsiCamera> CamssCsi::enumCamera(MediaEntity *phy)
 	if (ret)
 		return nullptr;
 
+	/*
+	 * The IFE's pixel path, where the camss driver exposes it: the CSID's
+	 * pixel port is its pad 4, feeding msm_vfe%d_pix, whose source pad 1
+	 * goes to a video node delivering the processed frames.
+	 */
+	std::string pixName = vfe->name();
+	size_t rdiPos = pixName.rfind("_rdi");
+	if (rdiPos != std::string::npos) {
+		pixName = pixName.substr(0, rdiPos) + "_pix";
+		MediaEntity *pix = camssMediaDev_->getEntityByName(pixName);
+		MediaLink *pixLink = pix ? camssMediaDev_->link(csid, 4, pix, 0) : nullptr;
+		if (pixLink && pix->pads().size() >= 2 && !pix->pads()[1]->links().empty()) {
+			MediaEntity *pixOutput = pix->pads()[1]->links()[0]->sink()->entity();
+			cam->pixSubdev_ = std::make_unique<V4L2Subdevice>(pix);
+			cam->pixOutput_ = std::make_unique<V4L2VideoDevice>(pixOutput);
+			if (cam->pixSubdev_->open() || cam->pixOutput_->open()) {
+				cam->pixSubdev_.reset();
+				cam->pixOutput_.reset();
+			} else {
+				cam->pixLink_ = pixLink;
+			}
+		}
+	}
+
 	LOG(Camss, Info)
 		<< "Sensor " << cam->sensor_->entity()->name()
 		<< " phy " << phy->name()
 		<< " decoder " << csid->name()
-		<< " VFE " << vfe->name();
+		<< " VFE " << vfe->name()
+		<< (cam->pixLink_ ? " with pixel path" : "");
 
-	csids_.erase(csids_.begin());
-	vfes_.erase(vfes_.begin());
+	csids_.erase(csidIt);
+	vfes_.erase(vfeIt);
 	return cam;
 }
 
