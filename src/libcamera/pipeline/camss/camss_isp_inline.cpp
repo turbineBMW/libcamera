@@ -259,7 +259,7 @@ CamssIspInline::CamssIspInline(CamssCsiCamera *csi, CamssFrames *frameInfos)
  *   ccm_strength: 1.0                                   # blend towards identity
  *   ccm_offsets: [r, g, b]                              # fraction of full scale
  *   lsc: { r: [221 gains], gr: [...], gb: [...], b: [...] }  # 13 rows x 17 columns
- *   lsc_strength: 1.0                                   # blend towards unity
+ *   lsc_strength: 1.0                                   # blend towards unity, 0 = block off
  *   lsc_response: [a, b]                                # applied = a g^2 + b g + (1 - a - b)
  *
  * Without a file the loop keeps its defaults and the driver its own curve
@@ -369,6 +369,9 @@ void CamssIspInline::loadTuning()
 							       QCOM_CAMSS_LSC_UNITY, QCOM_CAMSS_LSC_MAX));
 			}
 		}
+		/* strength 0 switches the block off rather than running it at unity */
+		if (strength == 0.0)
+			std::fill(mesh.begin(), mesh.end(), 0);
 		if (!mesh.empty())
 			lscMesh_ = std::move(mesh);
 	}
