@@ -8,6 +8,7 @@
 #pragma once
 
 #include <array>
+#include <map>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -15,6 +16,7 @@
 #include "libcamera/internal/v4l2_subdevice.h"
 #include "libcamera/internal/v4l2_videodevice.h"
 
+#include "camss_denoise.h"
 #include "camss_isp.h"
 
 namespace libcamera {
@@ -23,6 +25,7 @@ class CamssCsiCamera;
 class CamssFrames;
 class CameraSensor;
 class ControlInfoMap;
+class MappedFrameBuffer;
 
 /*
  * The CAMSS driver's PIX line: the CSID's pixel port feeds the IFE's image
@@ -70,6 +73,9 @@ private:
 	void loadTuning();
 	void bufferReady(FrameBuffer *buffer);
 	void runAlgorithms(FrameBuffer *buffer, unsigned int frame);
+	MappedFrameBuffer *mapBuffer(FrameBuffer *buffer);
+	bool framePlanes(FrameBuffer *buffer, uint8_t **y, uint8_t **c);
+	void denoise(FrameBuffer *buffer, unsigned int frame);
 	void fillMetadata(ControlList &metadata) const;
 	void publishControls(ControlInfoMap *ispControls) const;
 	void updateLineDuration();
@@ -116,6 +122,10 @@ private:
 	std::optional<std::array<uint16_t, 256>> gammaLut_;
 	std::optional<std::array<int32_t, 12>> ccm_;
 	std::optional<std::vector<uint16_t>> lscMesh_;
+	CamssDenoise::Params denoiseParams_;
+
+	CamssDenoise denoise_;
+	std::map<FrameBuffer *, std::unique_ptr<MappedFrameBuffer>> maps_;
 };
 
 } /* namespace libcamera */

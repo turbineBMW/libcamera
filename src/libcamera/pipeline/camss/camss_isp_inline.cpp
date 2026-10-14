@@ -8,16 +8,19 @@
 #include "camss_isp_inline.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
 #include <string>
 #include <vector>
 
+#include <linux/dma-buf.h>
 #include <linux/media-bus-format.h>
 #include <linux/qcom-camss-controls.h>
 #include <linux/v4l2-controls.h>
 #include <linux/videodev2.h>
+#include <sys/ioctl.h>
 
 #include <libcamera/base/file.h>
 #include <libcamera/base/log.h>
@@ -274,6 +277,7 @@ CamssIspInline::CamssIspInline(CamssCsiCamera *csi, CamssFrames *frameInfos)
  *   lsc: { r: [221 gains], gr: [...], gb: [...], b: [...] }  # 13 rows x 17 columns
  *   lsc_strength: 1.0                                   # blend towards unity, 0 = block off
  *   lsc_response: [a, b]                                # applied = a g^2 + b g + (1 - a - b)
+ *   denoise: { enable: true, temporal: 0.2, threshold: 2.5, ramp: 2.0, chroma_radius: 2 }
  *
  * Without a file the loop keeps its defaults and the driver its own curve
  * and identity matrix.
@@ -310,6 +314,13 @@ void CamssIspInline::loadTuning()
 	awbRedBias_ = awb["red_bias"].get<double>().value_or(1.0);
 	awbBlueBias_ = awb["blue_bias"].get<double>().value_or(1.0);
 	blackLevel_ = (*root)["black_level"].get<int32_t>().value_or(kDefaultBlackLevel);
+
+	const ValueNode &dn = (*root)["denoise"];
+	denoiseParams_.enabled = dn["enable"].get<bool>().value_or(denoiseParams_.enabled);
+	denoiseParams_.minWeight = dn["temporal"].get<double>().value_or(denoiseParams_.minWeight);
+	denoiseParams_.threshold = dn["threshold"].get<double>().value_or(denoiseParams_.threshold);
+	denoiseParams_.ramp = dn["ramp"].get<double>().value_or(denoiseParams_.ramp);
+	denoiseParams_.chromaRadius = dn["chroma_radius"].get<uint32_t>().value_or(denoiseParams_.chromaRadius);
 
 	if (root->contains("gamma_lut")) {
 		auto values = (*root)["gamma_lut"].get<std::vector<uint32_t>>();
@@ -391,7 +402,8 @@ void CamssIspInline::loadTuning()
 
 	LOG(Camss, Info) << "Tuning from " << path << ": target " << targetLuma_
 			 << (gammaLut_ ? ", gamma curve" : "") << (ccm_ ? ", colour matrix" : "")
-			 << (lscMesh_ ? ", shading mesh" : "");
+			 << (lscMesh_ ? ", shading mesh" : "")
+			 << (denoiseParams_.enabled ? ", denoise" : "");
 }
 
 CamssIspInline::~CamssIspInline() = default;
@@ -525,6 +537,7 @@ int CamssIspInline::configure(const StreamConfiguration &inputCfg,
 	size_ = fmt.size;
 	stride_ = fmt.planes[0].bpl;
 	bufferCount_ = outputCfg.bufferCount;
+	denoise_.configure(size_, stride_, denoiseParams_);
 
 	/*
 	 * The exposure limit follows the frame length the sensor currently
@@ -558,6 +571,7 @@ int CamssIspInline::allocateBuffers(unsigned int bufferCount)
 
 void CamssIspInline::freeBuffers()
 {
+	maps_.clear();
 	if (output_->releaseBuffers())
 		LOG(Camss, Error) << "Failed to release PIX buffers";
 }
@@ -639,6 +653,7 @@ void CamssIspInline::processStats([[maybe_unused]] const uint32_t frame,
 int CamssIspInline::start()
 {
 	frameCount_ = 0;
+	denoise_.reset();
 	applyTables();
 	applyIsp();
 	applySensor();
@@ -650,6 +665,7 @@ void CamssIspInline::stop()
 {
 	if (output_->streamOff())
 		LOG(Camss, Error) << "PIX stream off failed";
+	maps_.clear();
 }
 
 /*
@@ -700,6 +716,76 @@ void CamssIspInline::applyIsp()
 }
 
 /*
+ * The output buffers are the application's and come back request after
+ * request; map each once, read-write, and keep it until the stream stops.
+ */
+MappedFrameBuffer *CamssIspInline::mapBuffer(FrameBuffer *buffer)
+{
+	auto it = maps_.find(buffer);
+	if (it != maps_.end())
+		return it->second.get();
+
+	auto map = std::make_unique<MappedFrameBuffer>(buffer, MappedFrameBuffer::MapFlag::ReadWrite);
+	if (!map->isValid()) {
+		LOG(Camss, Warning) << "Cannot map the output buffer";
+		return nullptr;
+	}
+	return maps_.emplace(buffer, std::move(map)).first->second.get();
+}
+
+/* NV12 comes as one V4L2 plane but two logical planes, or as one */
+bool CamssIspInline::framePlanes(FrameBuffer *buffer, uint8_t **y, uint8_t **c)
+{
+	MappedFrameBuffer *map = mapBuffer(buffer);
+	if (!map)
+		return false;
+
+	const std::vector<Span<uint8_t>> &planes = map->planes();
+	unsigned int h = size_.height;
+	*y = planes[0].data();
+	if (planes.size() >= 2) {
+		*c = planes[1].data();
+		if (planes[0].size() < stride_ * h || planes[1].size() < stride_ * (h / 2)) {
+			LOG(Camss, Warning) << "Output planes too small";
+			return false;
+		}
+	} else {
+		*c = *y + stride_ * h;
+		if (planes[0].size() < stride_ * h * 3 / 2) {
+			LOG(Camss, Warning) << "Output plane too small";
+			return false;
+		}
+	}
+	return true;
+}
+
+/*
+ * Noise reduction in place, before the buffer goes to the application;
+ * the CPU's view of the dma-buf is synchronised around it.
+ */
+void CamssIspInline::denoise(FrameBuffer *buffer, unsigned int frame)
+{
+	uint8_t *y, *c;
+	if (!framePlanes(buffer, &y, &c))
+		return;
+
+	int fd = buffer->planes()[0].fd.get();
+	struct dma_buf_sync sync = { DMA_BUF_SYNC_START | DMA_BUF_SYNC_RW };
+	ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync);
+
+	auto t0 = std::chrono::steady_clock::now();
+	denoise_.process(y, c);
+	auto t1 = std::chrono::steady_clock::now();
+
+	sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_RW;
+	ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync);
+	if (frame % 30 == 0)
+		LOG(Camss, Debug) << "denoise " << size_ << " in "
+				  << std::chrono::duration<double, std::milli>(t1 - t0).count()
+				  << " ms, noise " << denoise_.sigma() << " levels";
+}
+
+/*
  * Statistics from the NV12 output: mean luma, and linear mean R, G, B
  * recovered through BT.601 and the gamma the driver programs. From them,
  * exposure: full frame first, then gain to the knee, then a longer frame,
@@ -709,30 +795,12 @@ void CamssIspInline::applyIsp()
  */
 void CamssIspInline::runAlgorithms(FrameBuffer *buffer, unsigned int frame)
 {
-	MappedFrameBuffer map(buffer, MappedFrameBuffer::MapFlag::Read);
-	if (!map.isValid()) {
-		LOG(Camss, Warning) << "Cannot map the output buffer for statistics";
+	uint8_t *yp, *cp_;
+	if (!framePlanes(buffer, &yp, &cp_))
 		return;
-	}
-
-	/* NV12 comes as one V4L2 plane but two logical planes, or as one */
-	const std::vector<Span<uint8_t>> &planes = map.planes();
 	unsigned int w = size_.width, h = size_.height;
-	const uint8_t *y = planes[0].data();
-	const uint8_t *c;
-	if (planes.size() >= 2) {
-		c = planes[1].data();
-		if (planes[0].size() < stride_ * h || planes[1].size() < stride_ * (h / 2)) {
-			LOG(Camss, Warning) << "Output planes too small for statistics";
-			return;
-		}
-	} else {
-		c = y + stride_ * h;
-		if (planes[0].size() < stride_ * h * 3 / 2) {
-			LOG(Camss, Warning) << "Output plane too small for statistics";
-			return;
-		}
-	}
+	const uint8_t *y = yp;
+	const uint8_t *c = cp_;
 
 	/*
 	 * Centre-weighted: the middle half of the frame in each direction,
@@ -858,6 +926,9 @@ void CamssIspInline::bufferReady(FrameBuffer *buffer)
 	 * Every fourth frame feeds the loop; the controls land within a frame
 	 * or two.
 	 */
+	if (ok && denoise_.enabled())
+		denoise(buffer, frame);
+
 	outputBufferReady.emit(buffer);
 
 	if (ok && (frameCount_++ % 4) == 0)
