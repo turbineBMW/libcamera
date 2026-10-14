@@ -563,23 +563,31 @@ void CamssIspInline::runAlgorithms(FrameBuffer *buffer, unsigned int frame)
 	double k = std::pow(kTargetLuma / 255.0, 2.2) / std::max(std::pow(meanY / 255.0, 2.2), 1e-4);
 	k = std::clamp(std::pow(k, 0.6), 0.5, 2.0);
 
-	const double gainMin = 256.0;	/* the IMX681's unity code is 0; use 256 as the floor the loop reasons in */
-	double total = (double)exposure_.exposure * std::max<double>(exposure_.gain, gainMin) *
+	/*
+	 * Work in linear light: exposure lines times the real gain multiplier
+	 * (the sensor's code 0 is unity, 1024 / (1024 - code) above it).
+	 * Treating the code as the multiplier put a 1.33x step at the point
+	 * where the loop moves from exposure to gain, and the picture hunted
+	 * across it at a third of a stop.
+	 */
+	const double knee = gainFromCode(kGainKnee);
+	const double gainTop = gainFromCode(gainMax_);
+	double total = (double)exposure_.exposure * gainFromCode(exposure_.gain) *
 		       exposure_.digital * k / kWbUnity;
 	int32_t frameLines = exposureMax_ + exposureMargin_;
 	int32_t exposureSlow = (int32_t)(frameLines * kSlowFrame) - exposureMargin_;
 	Exposure e;
-	if (total <= exposureMax_ * gainMin) {
-		e = { std::max<int32_t>(100, std::min<int32_t>(exposureMax_, total / gainMin)), 0, vblankDef_, kWbUnity };
-	} else if (total <= exposureMax_ * kGainKnee) {
-		e = { exposureMax_, std::min<int32_t>(kGainKnee, total / exposureMax_), vblankDef_, kWbUnity };
-	} else if (total <= (double)exposureSlow * kGainKnee) {
-		e = { std::min<int32_t>(exposureSlow, total / kGainKnee), kGainKnee, 0, kWbUnity };
-	} else if (total <= (double)exposureSlow * gainMax_) {
-		e = { exposureSlow, std::min<int32_t>(gainMax_, total / exposureSlow), 0, kWbUnity };
+	if (total <= exposureMax_) {
+		e = { std::max<int32_t>(100, (int32_t)total), 0, vblankDef_, kWbUnity };
+	} else if (total <= exposureMax_ * knee) {
+		e = { exposureMax_, gainToCode(total / exposureMax_), vblankDef_, kWbUnity };
+	} else if (total <= exposureSlow * knee) {
+		e = { std::min<int32_t>(exposureSlow, total / knee), kGainKnee, 0, kWbUnity };
+	} else if (total <= exposureSlow * gainTop) {
+		e = { exposureSlow, std::min(gainToCode(total / exposureSlow), gainMax_), 0, kWbUnity };
 	} else {
 		e = { exposureSlow, gainMax_, 0,
-		      std::clamp<int32_t>(total / ((double)exposureSlow * gainMax_) * kWbUnity, kWbUnity, kDigitalMax) };
+		      std::clamp<int32_t>(total / (exposureSlow * gainTop) * kWbUnity, kWbUnity, kDigitalMax) };
 	}
 	e.vblank = std::clamp<int32_t>(e.exposure + exposureMargin_ - (frameLines - vblankDef_),
 				       vblankDef_, vblankMax_);
