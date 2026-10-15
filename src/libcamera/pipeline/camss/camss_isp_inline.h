@@ -137,6 +137,8 @@ private:
 
 	CamssDenoise denoise_;
 	CamssSpatial spatial_;
+	Size filterSize_;	/* the size the filters were set up for */
+	unsigned int filterStride_ = 0;
 	std::map<FrameBuffer *, std::unique_ptr<MappedFrameBuffer>> maps_;
 };
 

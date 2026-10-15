@@ -587,9 +587,20 @@ int CamssIspInline::configure(const StreamConfiguration &inputCfg,
 	size_ = fmt.size;
 	stride_ = fmt.planes[0].bpl;
 	bufferCount_ = outputCfg.bufferCount;
-	denoise_.configure(size_, stride_, denoiseParams_);
-	spatial_.configure(size_, stride_, spatialParams_);
-	spatialActive_ = true;
+	/*
+	 * A photo from a video stream (Snapshot) stops, reconfigures and
+	 * restarts at the same size. Keep the filters, with the temporal
+	 * history, across that: a reset there leaves the photo with one or
+	 * two frames of averaging, its noisiest moment. A stale history is
+	 * harmless; whatever changed in between counts as movement.
+	 */
+	if (size_ != filterSize_ || stride_ != filterStride_) {
+		denoise_.configure(size_, stride_, denoiseParams_);
+		spatial_.configure(size_, stride_, spatialParams_);
+		spatialActive_ = true;
+		filterSize_ = size_;
+		filterStride_ = stride_;
+	}
 
 	/*
 	 * The exposure limit follows the frame length the sensor currently
@@ -707,7 +718,6 @@ void CamssIspInline::processStats([[maybe_unused]] const uint32_t frame,
 int CamssIspInline::start()
 {
 	frameCount_ = 0;
-	denoise_.reset();
 	applyTables();
 	applyIsp();
 	applySensor();
