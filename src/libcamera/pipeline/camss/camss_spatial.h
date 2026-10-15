@@ -36,12 +36,16 @@ public:
 	struct Params {
 		bool enabled = true;
 		/* strength per level, finest first, in noise sigmas */
-		std::array<double, kLevels> luma = { 1.4, 1.2, 0.8, 0.5 };
+		std::array<double, kLevels> luma = { 0.8, 0.6, 0.3, 0.0 };
 		std::array<double, kLevels> chroma = { 2.0, 2.0, 2.0, 2.0 };
+		/* extra gain on luma detail that clearly stands above the noise */
+		std::array<double, kLevels> sharpen = { 0.0, 0.0, 0.0, 0.0 };
 		/* noise of each level relative to the finest */
 		std::array<double, kLevels> lumaRatios = { 1.0, 0.82, 0.53, 0.30 };
 		std::array<double, kLevels> chromaRatios = { 1.0, 0.76, 0.43, 0.24 };
 		unsigned int threads = 4;
+		/* lone luma spikes beyond the 8 neighbours' range by this many sigmas are clipped, 0 off */
+		double despeckle = 1.5;
 	};
 
 	~CamssSpatial();
@@ -64,11 +68,13 @@ private:
 
 	void allocate(Pyramid &p, unsigned int w, unsigned int h);
 	void parallel(unsigned int n, const std::function<void(unsigned int, unsigned int)> &fn);
+	void despeckle(Plane &pl, float margin);
 	void down(const Plane &src, Plane &dst);
 	void up(const Plane &src, Plane &dst, std::vector<float> &tmp);
 	double estimateNoise(const Pyramid &p);
 	void shrink(Pyramid &p, const std::array<double, kLevels> &k,
-		    const std::array<double, kLevels> &ratios, double sigma0);
+		    const std::array<double, kLevels> &ratios, double sigma0,
+		    const std::array<double, kLevels> &sharpen);
 
 	void startWorkers();
 	void stopWorkers();

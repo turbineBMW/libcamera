@@ -290,7 +290,8 @@ CamssIspInline::CamssIspInline(CamssCsiCamera *csi, CamssFrames *frameInfos)
  *   lsc_response: [a, b]                                # applied = a g^2 + b g + (1 - a - b)
  *   denoise: { enable: true, temporal: 0.2, threshold: 2.5, ramp: 2.0, chroma_radius: 2 }
  *   spatial: { enable: true, luma: [4 per level], chroma: [4], luma_ratios: [4],
- *              chroma_ratios: [4], threads: 4, min_noise: 1.5 }   # runs before denoise
+ *              chroma_ratios: [4], sharpen: [4], despeckle: 1.5,
+ *              threads: 4, min_noise: 1.5 }   # runs before denoise
  *
  * Without a file the loop keeps its defaults and the driver its own curve
  * and identity matrix.
@@ -358,6 +359,8 @@ void CamssIspInline::loadTuning()
 	levels("chroma", spatialParams_.chroma);
 	levels("luma_ratios", spatialParams_.lumaRatios);
 	levels("chroma_ratios", spatialParams_.chromaRatios);
+	levels("sharpen", spatialParams_.sharpen);
+	spatialParams_.despeckle = sp["despeckle"].get<double>().value_or(spatialParams_.despeckle);
 
 	if (root->contains("gamma_lut")) {
 		auto values = (*root)["gamma_lut"].get<std::vector<uint32_t>>();

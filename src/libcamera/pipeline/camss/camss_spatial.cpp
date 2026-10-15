@@ -138,6 +138,38 @@ void CamssSpatial::parallel(unsigned int n, const std::function<void(unsigned in
 	done_.wait(l, [&] { return pending_ == 0; });
 }
 
+/*
+ * Clip each sample to the range of its eight neighbours widened by a
+ * margin: a lone noise spike (or a weak hot or dead pixel) stands out of
+ * every neighbourhood, an edge or a line does not. The pyramid's local
+ * energy test would otherwise keep a big enough spike as detail.
+ */
+void CamssSpatial::despeckle(Plane &pl, float margin)
+{
+	const unsigned int w = pl.w, h = pl.h;
+	float *__restrict out = tmp_.data();
+
+	parallel(h, [&](unsigned int r0, unsigned int r1) {
+		for (unsigned int y = r0; y < r1; y++) {
+			const float *a = &pl.g[(y ? y - 1 : 0) * w];
+			const float *b = &pl.g[y * w];
+			const float *c = &pl.g[std::min(y + 1, h - 1) * w];
+			float *o = out + static_cast<size_t>(y) * w;
+			o[0] = b[0];
+			o[w - 1] = b[w - 1];
+			/* pairwise min and max, which the vectoriser turns into fmin/fmax */
+			for (unsigned int x = 1; x + 1 < w; x++) {
+				float lo = std::min(std::min(std::min(a[x - 1], a[x]), std::min(a[x + 1], b[x - 1])),
+						    std::min(std::min(b[x + 1], c[x - 1]), std::min(c[x], c[x + 1])));
+				float hi = std::max(std::max(std::max(a[x - 1], a[x]), std::max(a[x + 1], b[x - 1])),
+						    std::max(std::max(b[x + 1], c[x - 1]), std::max(c[x], c[x + 1])));
+				o[x] = std::min(std::max(b[x], lo - margin), hi + margin);
+			}
+		}
+	});
+	std::copy_n(out, static_cast<size_t>(w) * h, pl.g.begin());
+}
+
 /* 2x2 mean; odd last rows or columns are dropped */
 void CamssSpatial::down(const Plane &src, Plane &dst)
 {
@@ -219,13 +251,15 @@ double CamssSpatial::estimateNoise(const Pyramid &p)
  * energy E, t the level's strength times its noise.
  */
 void CamssSpatial::shrink(Pyramid &p, const std::array<double, kLevels> &k,
-			  const std::array<double, kLevels> &ratios, double sigma0)
+			  const std::array<double, kLevels> &ratios, double sigma0,
+			  const std::array<double, kLevels> &sharpen)
 {
 	for (int l = kLevels - 1; l >= 0; l--) {
 		Plane &pl = p[l];
 		const unsigned int w = pl.w, h = pl.h;
 		const float t = k[l] * ratios[l] * sigma0;
 		const float t2 = t * t;
+		const float boost = sharpen[l];
 
 		/* up(out of the coarser level); the coarsest level's out is its g */
 		Plane &coarse = p[l + 1];
@@ -238,7 +272,7 @@ void CamssSpatial::shrink(Pyramid &p, const std::array<double, kLevels> &k,
 			up(coarse, pl, tmp_);
 		}
 
-		if (t2 <= 0.0f) {
+		if (t2 <= 0.0f && boost == 0.0f) {
 			parallel(h, [&](unsigned int r0, unsigned int r1) {
 				for (unsigned int y = r0; y < r1; y++) {
 					float *__restrict o = &pl.u[y * w];
@@ -273,7 +307,8 @@ void CamssSpatial::shrink(Pyramid &p, const std::array<double, kLevels> &k,
 				for (unsigned int x = 0; x < w; x++) {
 					float e = (ea[x] + eb[x] + ec[x]) * (1.0f / 9.0f);
 					float g = std::max(1.0f - t2 / std::max(e, 1e-6f), 0.0f);
-					o[x] += d[x] * g;
+					/* g^2 keeps the boost off anything near the noise */
+					o[x] += d[x] * g * (1.0f + boost * g * g);
 				}
 			}
 		});
@@ -305,6 +340,10 @@ void CamssSpatial::process(uint8_t *y, uint8_t *uv)
 		}
 	});
 
+	/* the margin follows the last frame's noise; the first frame gets a wide one */
+	if (params_.despeckle > 0.0)
+		despeckle(luma_[0], params_.despeckle * (lumaSigma_ > 0.0 ? lumaSigma_ : 8.0));
+
 	/* Gaussian levels, then each level's detail against the next one up */
 	for (Pyramid *p : { &luma_, &cb_, &cr_ }) {
 		for (unsigned int l = 0; l < kLevels; l++)
@@ -331,9 +370,10 @@ void CamssSpatial::process(uint8_t *y, uint8_t *uv)
 	for (Pyramid *p : { &luma_, &cb_, &cr_ })
 		(*p)[kLevels].u = (*p)[kLevels].g;
 
-	shrink(luma_, params_.luma, params_.lumaRatios, lumaSigma_);
-	shrink(cb_, params_.chroma, params_.chromaRatios, chromaSigma_);
-	shrink(cr_, params_.chroma, params_.chromaRatios, chromaSigma_);
+	static const std::array<double, kLevels> none{};
+	shrink(luma_, params_.luma, params_.lumaRatios, lumaSigma_, params_.sharpen);
+	shrink(cb_, params_.chroma, params_.chromaRatios, chromaSigma_, none);
+	shrink(cr_, params_.chroma, params_.chromaRatios, chromaSigma_, none);
 
 	/* planes out, rounded and clamped */
 	parallel(h, [&](unsigned int r0, unsigned int r1) {
