@@ -72,7 +72,7 @@ private:
 
 	void startWorkers();
 	void stopWorkers();
-	void workerMain(unsigned int index);
+	void workerMain(unsigned int index, uint64_t start);
 
 	/* a small pool: parallel() hands every worker one band of the rows */
 	std::vector<std::thread> workers_;

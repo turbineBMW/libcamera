@@ -258,6 +258,10 @@ CamssIspInline::CamssIspInline(CamssCsiCamera *csi, CamssFrames *frameInfos)
 	spatialActive_ = true;
 	centreWeight_ = kCentreWeight;
 	slowFrame_ = kSlowFrame;
+	sensorDigitalMax_ = 1.0;
+	hasSensorDigital_ = ctrls.find(V4L2_CID_DIGITAL_GAIN) != ctrls.end();
+	awbWarmth_ = 0.0;
+	awbNeutral_ = 1.0;
 	awbRedBias_ = 1.0;
 	awbBlueBias_ = 1.0;
 	loadTuning();
@@ -273,6 +277,8 @@ CamssIspInline::CamssIspInline(CamssCsiCamera *csi, CamssFrames *frameInfos)
  *   version: 1
  *   ae: { target: 120, centre_weight: 3, slow_frame: 2 }   # frame length cap, x default
  *   awb: { red_bias: 1.0, blue_bias: 0.95 }    # leave some of the illuminant in
+ *   awb: { warmth: 0.25, neutral_ratio: 1.0 }   # keep part of a warm light's colour
+ *   ae: { sensor_digital_max: 6 }               # sensor digital gain after analogue
  *   black_level: 64                             # sensor pedestal, 10-bit units
  *   zoom: 1.3                                   # narrow the field of view (centre crop)
  *   gamma: { toe: 2.6, knee: 0.17, gamma: 2.9 }   # or gamma_lut: [256 x 0..4095]
@@ -318,9 +324,12 @@ void CamssIspInline::loadTuning()
 	targetLuma_ = ae["target"].get<double>().value_or(kTargetLuma);
 	centreWeight_ = ae["centre_weight"].get<double>().value_or(kCentreWeight);
 	slowFrame_ = std::max(ae["slow_frame"].get<double>().value_or(kSlowFrame), 1.0);
+	sensorDigitalMax_ = std::clamp(ae["sensor_digital_max"].get<double>().value_or(1.0), 1.0, 15.0);
 	const ValueNode &awb = (*root)["awb"];
 	awbRedBias_ = awb["red_bias"].get<double>().value_or(1.0);
 	awbBlueBias_ = awb["blue_bias"].get<double>().value_or(1.0);
+	awbWarmth_ = std::clamp(awb["warmth"].get<double>().value_or(0.0), 0.0, 1.0);
+	awbNeutral_ = std::max(awb["neutral_ratio"].get<double>().value_or(1.0), 0.1);
 	blackLevel_ = (*root)["black_level"].get<int32_t>().value_or(kDefaultBlackLevel);
 	zoom_ = (*root)["zoom"].get<double>().value_or(1.0);
 
@@ -655,6 +664,7 @@ int CamssIspInline::queueRequest(Request *request)
 							       (frameLines - vblankDef_),
 							       vblankDef_, vblankMax_);
 			exposure_.digital = kWbUnity;
+			exposure_.sensorDigital = 256;
 			sensorChanged = ispChanged = true;
 		}
 	}
@@ -662,6 +672,7 @@ int CamssIspInline::queueRequest(Request *request)
 		aeEnabled_ = false;
 		exposure_.gain = std::min(gainToCode(*gain), gainMax_);
 		exposure_.digital = kWbUnity;
+		exposure_.sensorDigital = 256;
 		sensorChanged = ispChanged = true;
 	}
 	if (const auto &ae = ctrls.get(controls::AeEnable))
@@ -719,6 +730,8 @@ void CamssIspInline::applySensor()
 	CameraSensor *sensor = const_cast<CameraSensor *>(sensor_);
 	ControlList vblank(sensor->controls());
 	vblank.set(V4L2_CID_VBLANK, exposure_.vblank);
+	if (hasSensorDigital_)
+		vblank.set(V4L2_CID_DIGITAL_GAIN, exposure_.sensorDigital);
 	sensor->setControls(&vblank);
 
 	ControlList ctrls(sensor->controls());
@@ -907,7 +920,13 @@ void CamssIspInline::runAlgorithms(FrameBuffer *buffer, unsigned int frame)
 	const double knee = gainFromCode(kGainKnee);
 	const double gainTop = gainFromCode(gainMax_);
 	double total = (double)exposure_.exposure * gainFromCode(exposure_.gain) *
-		       exposure_.digital * k / kWbUnity;
+		       exposure_.sensorDigital / 256.0 * exposure_.digital * k / kWbUnity;
+	/*
+	 * Past the analogue gain, the sensor's digital gain before the IFE's:
+	 * it costs the same noise, but gain in the IFE shares its limit with
+	 * the white balance and runs out first under warm light.
+	 */
+	const double sdMax = hasSensorDigital_ ? sensorDigitalMax_ : 1.0;
 	int32_t frameLines = exposureMax_ + exposureMargin_;
 	int32_t exposureSlow = (int32_t)(frameLines * slowFrame_) - exposureMargin_;
 	Exposure e;
@@ -919,9 +938,14 @@ void CamssIspInline::runAlgorithms(FrameBuffer *buffer, unsigned int frame)
 		e = { std::min<int32_t>(exposureSlow, total / knee), kGainKnee, 0, kWbUnity };
 	} else if (total <= exposureSlow * gainTop) {
 		e = { exposureSlow, std::min(gainToCode(total / exposureSlow), gainMax_), 0, kWbUnity };
+	} else if (total <= exposureSlow * gainTop * sdMax) {
+		e = { exposureSlow, gainMax_, 0, kWbUnity,
+		      std::clamp<int32_t>(std::lround(total / (exposureSlow * gainTop) * 256), 256,
+					  std::lround(sdMax * 256)) };
 	} else {
 		e = { exposureSlow, gainMax_, 0,
-		      std::clamp<int32_t>(total / (exposureSlow * gainTop) * kWbUnity, kWbUnity, digitalMax()) };
+		      std::clamp<int32_t>(total / (exposureSlow * gainTop * sdMax) * kWbUnity, kWbUnity, digitalMax()),
+		      static_cast<int32_t>(std::lround(sdMax * 256)) };
 	}
 	e.vblank = std::clamp<int32_t>(e.exposure + exposureMargin_ - (frameLines - vblankDef_),
 				       vblankDef_, vblankMax_);
@@ -930,8 +954,14 @@ void CamssIspInline::runAlgorithms(FrameBuffer *buffer, unsigned int frame)
 
 	/* White balance, incremental grey world */
 	if (awbEnabled_) {
-	double kr = awbRedBias_ * G / std::max(R, 1e-4);
-	double kb = awbBlueBias_ * G / std::max(B, 1e-4);
+	/*
+	 * Under a warm light (blue gain well above red) leave part of its
+	 * colour in, as a warm room looks warm to the eye: the bias moves
+	 * with the light's warmth, by its share 'warmth'.
+	 */
+	double warm = std::sqrt(std::max(static_cast<double>(wbBlue_) / wbRed_ / awbNeutral_, 1.0));
+	double kr = awbRedBias_ * std::pow(warm, awbWarmth_) * G / std::max(R, 1e-4);
+	double kb = awbBlueBias_ * std::pow(warm, -awbWarmth_) * G / std::max(B, 1e-4);
 	wbRed_ = std::clamp<int32_t>(wbRed_ * std::pow(kr, 0.5), 256, kWbMax);
 	wbBlue_ = std::clamp<int32_t>(wbBlue_ * std::pow(kb, 0.5), 256, kWbMax);
 	}
@@ -945,6 +975,7 @@ void CamssIspInline::runAlgorithms(FrameBuffer *buffer, unsigned int frame)
 				  << " exposure " << exposure_.exposure
 				  << " vblank " << exposure_.vblank
 				  << " gain " << exposure_.gain
+				  << " sensor digital " << exposure_.sensorDigital
 				  << " digital " << exposure_.digital
 				  << " R " << wbRed_ << " B " << wbBlue_;
 }
@@ -955,7 +986,8 @@ void CamssIspInline::fillMetadata(ControlList &metadata) const
 	metadata.set(controls::ExposureTime,
 		     static_cast<int32_t>(std::lround(exposure_.exposure * lineDurationUs_)));
 	metadata.set(controls::AnalogueGain, gainFromCode(exposure_.gain));
-	metadata.set(controls::DigitalGain, exposure_.digital / static_cast<float>(kWbUnity));
+	metadata.set(controls::DigitalGain, exposure_.digital / static_cast<float>(kWbUnity) *
+						    exposure_.sensorDigital / 256.0f);
 	metadata.set(controls::AwbEnable, awbEnabled_);
 	metadata.set(controls::ColourGains, Span<const float, 2>({ wbRed_ / 1024.0f, wbBlue_ / 1024.0f }));
 	metadata.set(controls::SensorBlackLevels,

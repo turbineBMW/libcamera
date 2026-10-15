@@ -68,7 +68,8 @@ private:
 		int32_t exposure;
 		int32_t gain;
 		int32_t vblank;
-		int32_t digital;	/* Q10 */
+		int32_t digital;	/* Q10, in the IFE */
+		int32_t sensorDigital = 256;	/* Q8, in the sensor */
 	};
 
 	void loadTuning();
@@ -119,6 +120,10 @@ private:
 	double targetLuma_;
 	double zoom_;		/* field of view narrowed by this factor */
 	double centreWeight_;
+	double sensorDigitalMax_;	/* sensor digital gain the loop may use, 1 = none */
+	bool hasSensorDigital_;
+	double awbWarmth_;	/* share of a warm light's colour kept, 0..1 */
+	double awbNeutral_;	/* blue/red gain ratio above which a light counts as warm */
 	double slowFrame_;	/* longest frame in the dark, in default frame lengths */
 	double awbRedBias_;	/* multipliers on the grey-world gains */
 	double awbBlueBias_;

@@ -42,9 +42,15 @@ CamssSpatial::~CamssSpatial()
 
 void CamssSpatial::startWorkers()
 {
+	/*
+	 * A new worker starts at the current generation, or it would take
+	 * the last job of an earlier configuration (its function long gone)
+	 * for a new one.
+	 */
+	std::lock_guard<std::mutex> l(lock_);
 	quit_ = false;
 	for (unsigned int i = 1; i < params_.threads; i++)
-		workers_.emplace_back(&CamssSpatial::workerMain, this, i);
+		workers_.emplace_back(&CamssSpatial::workerMain, this, i, generation_);
 }
 
 void CamssSpatial::stopWorkers()
@@ -59,9 +65,9 @@ void CamssSpatial::stopWorkers()
 	workers_.clear();
 }
 
-void CamssSpatial::workerMain(unsigned int index)
+void CamssSpatial::workerMain(unsigned int index, uint64_t start)
 {
-	uint64_t seen = 0;
+	uint64_t seen = start;
 
 	for (;;) {
 		const std::function<void(unsigned int, unsigned int)> *job;
