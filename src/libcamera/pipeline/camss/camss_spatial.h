@@ -46,6 +46,8 @@ public:
 		unsigned int threads = 4;
 		/* lone luma spikes beyond the 8 neighbours' range by this many sigmas are clipped, 0 off */
 		double despeckle = 1.5;
+		/* 3x3 median on the filtered chroma: the colour spikes the pyramid kept */
+		bool chromaMedian = true;
 	};
 
 	~CamssSpatial();
@@ -69,6 +71,7 @@ private:
 	void allocate(Pyramid &p, unsigned int w, unsigned int h);
 	void parallel(unsigned int n, const std::function<void(unsigned int, unsigned int)> &fn);
 	void despeckle(Plane &pl, float margin);
+	void median3(std::vector<float> &plane, unsigned int w, unsigned int h);
 	void down(const Plane &src, Plane &dst);
 	void up(const Plane &src, Plane &dst, std::vector<float> &tmp);
 	double estimateNoise(const Pyramid &p);

@@ -170,6 +170,44 @@ void CamssSpatial::despeckle(Plane &pl, float margin)
 	std::copy_n(out, static_cast<size_t>(w) * h, pl.g.begin());
 }
 
+/*
+ * 3x3 median, by the 19-comparison network for nine values (Paeth); min
+ * and max only, so the rows vectorise. Run on the filtered chroma, it
+ * removes the colour spikes (up to four samples across) that stood out
+ * enough for the pyramid to keep as detail; on chroma it costs no visible
+ * detail. It runs after the filter, not before, so the noise measured for
+ * the pyramid is still the real one.
+ */
+void CamssSpatial::median3(std::vector<float> &plane, unsigned int w, unsigned int h)
+{
+	float *__restrict out = tmp_.data();
+
+	parallel(h, [&](unsigned int r0, unsigned int r1) {
+		for (unsigned int y = r0; y < r1; y++) {
+			const float *a = &plane[(y ? y - 1 : 0) * w];
+			const float *b = &plane[y * w];
+			const float *c = &plane[std::min(y + 1, h - 1) * w];
+			float *o = out + static_cast<size_t>(y) * w;
+			o[0] = b[0];
+			o[w - 1] = b[w - 1];
+			for (unsigned int x = 1; x + 1 < w; x++) {
+				float p0 = a[x - 1], p1 = a[x], p2 = a[x + 1];
+				float p3 = b[x - 1], p4 = b[x], p5 = b[x + 1];
+				float p6 = c[x - 1], p7 = c[x], p8 = c[x + 1];
+				float t;
+#define S(i, j) t = std::min(i, j); j = std::max(i, j); i = t
+				S(p1, p2); S(p4, p5); S(p7, p8); S(p0, p1); S(p3, p4); S(p6, p7);
+				S(p1, p2); S(p4, p5); S(p7, p8); S(p0, p3); S(p5, p8); S(p4, p7);
+				S(p3, p6); S(p1, p4); S(p2, p5); S(p4, p7); S(p4, p2); S(p6, p4);
+				S(p4, p2);
+#undef S
+				o[x] = p4;
+			}
+		}
+	});
+	std::copy_n(out, static_cast<size_t>(w) * h, plane.begin());
+}
+
 /* 2x2 mean; odd last rows or columns are dropped */
 void CamssSpatial::down(const Plane &src, Plane &dst)
 {
@@ -374,6 +412,10 @@ void CamssSpatial::process(uint8_t *y, uint8_t *uv)
 	shrink(luma_, params_.luma, params_.lumaRatios, lumaSigma_, params_.sharpen);
 	shrink(cb_, params_.chroma, params_.chromaRatios, chromaSigma_, none);
 	shrink(cr_, params_.chroma, params_.chromaRatios, chromaSigma_, none);
+	if (params_.chromaMedian) {
+		median3(cb_[0].u, cb_[0].w, cb_[0].h);
+		median3(cr_[0].u, cr_[0].w, cr_[0].h);
+	}
 
 	/* planes out, rounded and clamped */
 	parallel(h, [&](unsigned int r0, unsigned int r1) {
